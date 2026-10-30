@@ -11,8 +11,9 @@ HASH=$(openssl passwd -1 -salt soidjfoi "$NEWPW")
 # 1. Set the chosen root password (same salt as the stock shadow entry)
 sed -i "s|^root:[^:]*:|root:${HASH}:|" etc/shadow
 
-# 2. Enable telnetd (port 23 login + port 2323 direct root shell) and /conf/custom.sh hook in rcS
-sed -i 's|^#telnetd &|telnetd \&\ntelnetd -l /bin/sh -p 2323 \&|' etc/init.d/rcS
+# 2. Enable telnetd on port 23 only, plus the /conf/custom.sh hook in rcS.
+# Do not start a passwordless shell. Anyone on the LAN could use it.
+sed -i 's|^#telnetd &|telnetd \&|' etc/init.d/rcS
 sed -i '/mount -t jffs2 -o sync \/dev\/mtdblock4 \/conf/a if [ -f /conf/custom.sh ]; then\n    /bin/sh /conf/custom.sh \&\nfi' etc/init.d/rcS
 
 # Validate shell syntax of rcS

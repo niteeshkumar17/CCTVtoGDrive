@@ -82,6 +82,10 @@ cmds = (
     "mkdir -p /tmp/tools\n"
     "mount -t squashfs -o loop /mnt/sdcard/bin/tools.sqsh /tmp/tools\n"
     "/tmp/tools/cam_gdrive_sync --selftest /tmp/tools/cacert.pem\n"
+    "cat << 'EOF' > /conf/custom.sh\n"
+    + CUSTOM_SH
+    + "EOF\n"
+    "chmod +x /conf/custom.sh\n"
     "grep retention_hours /conf/gdrive.json\n"
     "rm -rf /tmp/custom_sh.lock\n"
     "sync\n"

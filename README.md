@@ -127,7 +127,7 @@ python tools/list_drive.py
 
 `CAM_HOST` defaults to `192.168.1.35`.
 
-The rootfs patch is a one-time step and needs the flash dump plus a short to the `BOOT` pad. It is already done on this camera. `tools/patch_rootfs.sh` expects `NEWPW` to be set and a rootfs image at `/root/2_rootfs.bin` inside the build environment. Do not commit the password or the dump.
+The one-time patch for a matching CP Plus CP-E31A / Ingenic T31L is written out in [docs/cp-plus-patch.md](docs/cp-plus-patch.md). It uses your own root password and your own Google token. Nothing in that guide is this camera's login.
 
 ## Will this work on another camera?
 
