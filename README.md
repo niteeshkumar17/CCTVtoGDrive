@@ -129,6 +129,45 @@ python tools/list_drive.py
 
 The rootfs patch is a one-time step and needs the flash dump plus a short to the `BOOT` pad. It is already done on this camera. `tools/patch_rootfs.sh` expects `NEWPW` to be set and a rootfs image at `/root/2_rootfs.bin` inside the build environment. Do not commit the password or the dump.
 
+## Will this work on another camera?
+
+No. Not as a download-and-flash package, and not on every CP Plus or Tuya camera.
+
+It works on this unit because that unit is an Ingenic T31L whose flash is laid out like this:
+
+| Image | Size |
+| --- | --- |
+| U-Boot | 256 KB |
+| Kernel | 1,792 KB |
+| Rootfs squashfs | 960 KB (must stay under 983,040 bytes after the patch) |
+| App squashfs | 4,800 KB |
+| Config JFFS2 (`/conf`) | 384 KB |
+| Full chip backup | 8 MB |
+
+Another owner has to dump **their** chip, confirm the same layout, and patch **their** rootfs. Flashing this camera's image into a different board can brick it. The stock app, kernel, and config on this camera were never replaced.
+
+The phone-app and Frida work did not produce a working uploader. Putting that app online would not make the project succeed on another camera. Google Drive still needs each person's own OAuth client and refresh token. Copy `tools/gdrive.json.example` to `tools/gdrive.json` and fill it in locally. That file is gitignored.
+
+## What is not in this public repo
+
+These stay on the machine that owns the camera:
+
+- `tools/gdrive.json` and `tools/token_success.json`. Those are a live Google login. Stripping them is the example file above. There is no safe way to publish the real token.
+- The ONVIF password and Tuya user database inside the camera's `/conf` partition. Those are this camera's credentials.
+- Stock and patched firmware binaries, kernel, rootfs, the vendor app, kernel modules, and the decoded phone app. Those are the vendor's copyrighted code, and the patched rootfs also contains this camera's root password. The partition sizes and the boot-script change are documented here so the same patch can be repeated on a matching dump.
+- Serial logs and one-off password guesses. They were scratch work, and some of them contained secrets. They are not required to build or run the uploader.
+
+The step that actually opens the camera is in `tools/patch_rootfs.sh`: enable the commented-out `telnetd` line in `etc/init.d/rcS`, start `/conf/custom.sh` after `/conf` is mounted, and replace the root hash. Stock `rcS` has telnet disabled:
+
+```sh
+# Start telnet daemon
+#telnetd &
+mount -t squashfs /dev/mtdblock3 /app
+mount -t jffs2 -o sync /dev/mtdblock4 /conf
+```
+
+If your dumped `etc/shadow` uses the salt `soidjfoi`, it is the same rootfs family this patch was written for. You still choose your own `NEWPW`. Do not reuse a password you use anywhere else, and do not commit it.
+
 ## Precautions
 
 **Wi-Fi, not the public internet.**  
