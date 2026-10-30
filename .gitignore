@@ -1,0 +1,29 @@
+# Google account secrets. Never commit these.
+tools/gdrive.json
+tools/token_success.json
+*.token.json
+
+# Built camera binaries (rebuild with tools/build.sh)
+tools/tools.sqsh
+tools/cam_gdrive_sync
+tools/cacert.pem
+
+# Local flash backup and vendor images. Not part of this project.
+firmware/
+apk/
+frida/
+shots/
+recorder/
+
+# Session logs and serial captures
+*.log
+*.bin
+*.jpg
+
+# Editor / OS
+.cursor/
+.vscode/
+__pycache__/
+*.pyc
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,12 @@
+{
+  "client_id": "YOUR_GOOGLE_OAUTH_CLIENT_ID",
+  "client_secret": "YOUR_GOOGLE_OAUTH_CLIENT_SECRET",
+  "refresh_token": "YOUR_REFRESH_TOKEN",
+  "folder_id": "GOOGLE_DRIVE_CCTV_FOLDER_ID",
+  "folder_name": "CCTV",
+  "retention_hours": 2160,
+  "media_dir": "/mnt/sdcard/Media",
+  "state_file": "/conf/uploaded_v2.log",
+  "ca_cert_file": "/tmp/tools/cacert.pem",
+  "poll_seconds": 20
+}
