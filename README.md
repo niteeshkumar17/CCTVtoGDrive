@@ -10,7 +10,7 @@ The camera is a CP Plus CP-E31A (Tuya / ezykam style). The board is an Ingenic T
 - The camera uploads by itself. No always-on PC, tablet, or extra device at home.
 - The phone app keeps working: live view, SD playback, and the existing timeline.
 - If the camera is unplugged or taken, Drive already has the recent clips, not only the last finished multi-hour file.
-- Footage stays in Drive for 3 months. Google Pro storage covers that until 20 April 2027.
+- Old footage is deleted from Drive after `retention_hours`. Each person sets that to fit their own Drive plan.
 
 ## What did not work
 
@@ -86,7 +86,7 @@ Clips are fragmented MP4 (`ftyp` + `moov` + `moof`/`mdat`, 1000 Hz timestamps). 
 
 Memory on the camera is about 32 MB. The uploader drops the Linux page cache while streaming and keeps a small heap limit so recording is not pushed into swap.
 
-`retention_hours` in the config is how long files stay in Drive. It is set to `2160` (90 days, 3 months). The 72-hour SD scan is separate and is not controlled by that number. At roughly 4.5–5 GB per day, 90 days is on the order of 400–450 GB.
+`retention_hours` is how long files stay in Drive. Set it from your own free space. This camera records about 4.5–5 GB a day, so `hours = (free GB / 5) × 24`. A 15 GB free account can hold about 3 days (`72`). A plan with a few hundred GB free can hold longer. The 72-hour SD-card scan is separate and is not controlled by this number.
 
 ## Layout of this repo
 

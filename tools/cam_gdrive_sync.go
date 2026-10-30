@@ -893,7 +893,7 @@ func main() {
 			cfg.CACertFile = "/tmp/tools/cacert.pem"
 		}
 		if cfg.RetentionHrs == 0 {
-			cfg.RetentionHrs = 2160
+			cfg.RetentionHrs = 72
 		}
 		if cfg.PollSeconds <= 0 {
 			cfg.PollSeconds = 20

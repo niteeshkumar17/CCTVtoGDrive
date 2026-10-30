@@ -60,7 +60,7 @@ sudo bash tools/build.sh
 copy tools\gdrive.json.example tools\gdrive.json
 ```
 
-Edit `tools/gdrive.json` with your client id, client secret, refresh token, and the Drive folder id. `retention_hours` of `2160` keeps footage for 90 days. Use your own Google Cloud OAuth client. A shared public client gets rate-limited.
+Edit `tools/gdrive.json` with your client id, client secret, refresh token, and the Drive folder id. Set `retention_hours` from your own free space. The camera records about 4.5–5 GB a day, so `hours = (free GB / 5) × 24`. The `2160` in the example is 90 days and only fits a large plan. A 15 GB free account should use about `72`. Use your own Google Cloud OAuth client. A shared public client gets rate-limited.
 
 From the PC on the same LAN:
 
