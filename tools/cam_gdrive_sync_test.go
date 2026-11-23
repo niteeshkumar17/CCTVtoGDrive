@@ -475,3 +475,234 @@ func TestDriveAPIHelpers(t *testing.T) {
 		t.Fatalf("tz defaults=%d utc=%d", tzOffsetMinutes(&cDefault), tzOffsetMinutes(&cUTC))
 	}
 }
+
+func TestMergeMP4ClipsTruncatedMdatClampsHeader(t *testing.T) {
+	dir := t.TempDir()
+
+	// Clip 1 has valid ftyp/moov/moof, then an mdat header claiming 4096 bytes with only 12 bytes present.
+	ftyp := makeBox("ftyp", []byte("isom\x00\x00\x02\x00isom"))
+	moov := makeBox("moov", makeBox("mvhd", make([]byte, 16)))
+	mfhd := makeFullBox("mfhd", 0, 0, []byte{0, 0, 0, 1})
+	tfhd := makeFullBox("tfhd", 0, 0, make([]byte, 4))
+	tfdt := makeFullBox("tfdt", 1, 0, make([]byte, 8))
+	trun := makeFullBox("trun", 0, 0x100, []byte{0, 0, 0, 1, 0, 0, 3, 232})
+	moof := makeBox("moof", append(mfhd, makeBox("traf", append(append(tfhd, tfdt...), trun...))...))
+
+	var truncMdatHdr [8]byte
+	binary.BigEndian.PutUint32(truncMdatHdr[0:4], 4104)
+	copy(truncMdatHdr[4:8], "mdat")
+	var c1Bytes []byte
+	c1Bytes = append(c1Bytes, ftyp...)
+	c1Bytes = append(c1Bytes, moov...)
+	c1Bytes = append(c1Bytes, moof...)
+	c1Bytes = append(c1Bytes, truncMdatHdr[:]...)
+	c1Bytes = append(c1Bytes, []byte("TRUNC_12BYTE")...)
+
+	c1 := filepath.Join(dir, "01_trunc.mp4")
+	if err := os.WriteFile(c1, c1Bytes, 0644); err != nil {
+		t.Fatal(err)
+	}
+	c2 := makeSyntheticClip(t, dir, "02_ok.mp4", 1, 0, 1000, []byte("SECOND_OK"))
+
+	var out bytes.Buffer
+	if err := mergeMP4Clips(&out, []string{c1, c2}); err != nil {
+		t.Fatalf("mergeMP4Clips err: %v", err)
+	}
+
+	raw := out.Bytes()
+	var boxes []string
+	var mdats [][]byte
+	pos := 0
+	for pos+8 <= len(raw) {
+		sz := int(binary.BigEndian.Uint32(raw[pos : pos+4]))
+		typ := string(raw[pos+4 : pos+8])
+		if sz < 8 || pos+sz > len(raw) {
+			t.Fatalf("broken box framing at %d: typ=%s sz=%d len=%d", pos, typ, sz, len(raw))
+		}
+		boxes = append(boxes, typ)
+		if typ == "mdat" {
+			mdats = append(mdats, raw[pos+8:pos+sz])
+		}
+		pos += sz
+	}
+	if pos != len(raw) {
+		t.Fatalf("trailing unparsed bytes: pos=%d len=%d", pos, len(raw))
+	}
+	want := "ftyp,moov,moof,mdat,moof,mdat"
+	if strings.Join(boxes, ",") != want {
+		t.Fatalf("boxes = %v, want %s", boxes, want)
+	}
+	if len(mdats) != 2 || string(mdats[0]) != "TRUNC_12BYTE" || string(mdats[1]) != "SECOND_OK" {
+		t.Fatalf("unexpected mdat payloads: %q", mdats)
+	}
+}
+
+func TestFolderCacheClearOn404AndCap(t *testing.T) {
+	oldCache := folderCache
+	defer func() {
+		folderCache = oldCache
+	}()
+
+	folderCache = make(map[string]string)
+	for i := 0; i < 205; i++ {
+		setFolderCache(fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i))
+	}
+	if len(folderCache) >= 200 {
+		t.Fatalf("expected folderCache cap reset, got len=%d", len(folderCache))
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"tok","expires_in":3600}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"folder not found"}`))
+	}))
+	defer srv.Close()
+
+	oldAPI, oldTok, oldSleep := driveAPIBase, oauthTokenURL, sleepFunc
+	driveAPIBase = srv.URL
+	oauthTokenURL = srv.URL + "/token"
+	sleepFunc = func(time.Duration) {}
+	defer func() {
+		driveAPIBase, oauthTokenURL, sleepFunc = oldAPI, oldTok, oldSleep
+		invalidateToken()
+	}()
+
+	if err := initHTTP(""); err != nil {
+		t.Fatal(err)
+	}
+	invalidateToken()
+	setFolderCache("root/2026-11", "stale_id")
+
+	cfg := &Config{ClientID: "id", ClientSecret: "sec", RefreshToken: "ref", FolderID: "root"}
+	if _, err := initResumableUpload(cfg, "stale_id", "00-03.mp4", 10); err == nil {
+		t.Fatalf("expected 404 error")
+	}
+	if len(folderCache) != 0 {
+		t.Fatalf("expected folderCache cleared on 404, got %v", folderCache)
+	}
+}
+
+func TestDriveFileExistsAndNetworkRetry(t *testing.T) {
+	var mu sync.Mutex
+	getAttempts := 0
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"tok","expires_in":3600}`))
+			return
+		}
+		if r.Method == "GET" && r.URL.Path == "/drive/v3/files" {
+			mu.Lock()
+			getAttempts++
+			n := getAttempts
+			mu.Unlock()
+			if n == 1 {
+				// Simulate transient network drop by hijacking and closing TCP socket.
+				if hj, ok := w.(http.Hijacker); ok {
+					conn, _, err := hj.Hijack()
+					if err == nil {
+						conn.Close()
+						return
+					}
+				}
+			}
+			_, _ = w.Write([]byte(`{"files":[{"id":"f1","name":"00-03.mp4"}]}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	oldAPI, oldTok, oldSleep := driveAPIBase, oauthTokenURL, sleepFunc
+	driveAPIBase = srv.URL
+	oauthTokenURL = srv.URL + "/token"
+	sleepFunc = func(time.Duration) {}
+	defer func() {
+		driveAPIBase, oauthTokenURL, sleepFunc = oldAPI, oldTok, oldSleep
+		invalidateToken()
+		folderCache = make(map[string]string)
+	}()
+
+	if err := initHTTP(""); err != nil {
+		t.Fatal(err)
+	}
+	invalidateToken()
+	folderCache = make(map[string]string)
+	cfg := &Config{ClientID: "id", ClientSecret: "sec", RefreshToken: "ref", FolderID: "root"}
+
+	id, err := ensureSubfolder(cfg, "root", "00-03.mp4")
+	if err != nil || id != "f1" {
+		t.Fatalf("ensureSubfolder after transient drop = (%q, %v), want (f1, nil)", id, err)
+	}
+	if getAttempts != 2 {
+		t.Fatalf("expected 2 GET attempts, got %d", getAttempts)
+	}
+
+	exists, err := driveFileExists(cfg, "day1", "00-03.mp4")
+	if err != nil || !exists {
+		t.Fatalf("driveFileExists = (%v, %v), want (true, nil)", exists, err)
+	}
+}
+
+func TestFinalCommit403NoZeroByteProbe(t *testing.T) {
+	var mu sync.Mutex
+	var cl403 []int64
+	var cl503 []int64
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.URL.Path {
+		case "/403":
+			cl403 = append(cl403, r.ContentLength)
+			if len(cl403) < 3 {
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(`{"error":"rateLimitExceeded"}`))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"ok403"}`))
+		case "/503":
+			cl503 = append(cl503, r.ContentLength)
+			if len(cl503) == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"ok503"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	oldSleep := sleepFunc
+	sleepFunc = func(time.Duration) {}
+	defer func() { sleepFunc = oldSleep }()
+	if err := initHTTP(""); err != nil {
+		t.Fatal(err)
+	}
+
+	id, err := uploadStreamResumable(srv.URL+"/403", bytes.NewReader([]byte("hello")))
+	if err != nil || id != "ok403" {
+		t.Fatalf("403 retry = (%q, %v), want (ok403, nil)", id, err)
+	}
+	for i, cl := range cl403 {
+		if cl <= 0 {
+			t.Fatalf("403 attempt %d sent 0-byte probe (ContentLength=%d)", i, cl)
+		}
+	}
+
+	id, err = uploadStreamResumable(srv.URL+"/503", bytes.NewReader([]byte("hello")))
+	if err != nil || id != "ok503" {
+		t.Fatalf("503 retry = (%q, %v), want (ok503, nil)", id, err)
+	}
+	if len(cl503) != 2 || cl503[0] <= 0 || cl503[1] != 0 {
+		t.Fatalf("expected 503 to send chunk then 0-byte probe, got ContentLengths=%v", cl503)
+	}
+}

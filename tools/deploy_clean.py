@@ -146,6 +146,7 @@ def main() -> int:
             "  echo DEPLOY_MD5_FAIL\n"
             "fi\n"
             "if [ \"$GDRIVE_OK\" = \"1\" ] && [ \"$SQSH_OK\" = \"1\" ]; then\n"
+            "  : > /tmp/gdrive_err.log\n"
             "  md5sum /mnt/sdcard/bin/tools.sqsh\n"
             "  mkdir -p /tmp/tools\n"
             "  mount -t squashfs -o loop /mnt/sdcard/bin/tools.sqsh /tmp/tools\n"
@@ -169,9 +170,9 @@ def main() -> int:
             "exit\n"
         )
         sock.sendall(cmds.encode())
-        sock.settimeout(45.0)
+        sock.settimeout(90.0)
         out = b""
-        deadline = time.time() + 45.0
+        deadline = time.time() + 90.0
         while time.time() < deadline:
             try:
                 c = sock.recv(4096)

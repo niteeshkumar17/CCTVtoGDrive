@@ -6,20 +6,22 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-cfg = json.loads((pathlib.Path(__file__).with_name("gdrive.json")).read_text(encoding="utf-8"))
-data = urllib.parse.urlencode(
-    {
-        "client_id": cfg["client_id"],
-        "client_secret": cfg["client_secret"],
-        "refresh_token": cfg["refresh_token"],
-        "grant_type": "refresh_token",
-    }
-).encode()
-with urllib.request.urlopen(urllib.request.Request("https://oauth2.googleapis.com/token", data=data), timeout=15) as r:
-    access_token = json.loads(r.read().decode())["access_token"]
+
+def fetch_access_token(cfg: dict) -> str:
+    data = urllib.parse.urlencode(
+        {
+            "client_id": cfg["client_id"],
+            "client_secret": cfg["client_secret"],
+            "refresh_token": cfg["refresh_token"],
+            "grant_type": "refresh_token",
+        }
+    ).encode()
+    req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data)
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read().decode())["access_token"]
 
 
-def gget(url: str) -> dict:
+def gget(url: str, access_token: str) -> dict:
     for attempt in range(8):
         try:
             req = urllib.request.Request(url, headers={"Authorization": "Bearer " + access_token})
@@ -41,7 +43,7 @@ def gget(url: str) -> dict:
     return {}
 
 
-def walk(parent_id: str, indent: str = "") -> None:
+def walk(parent_id: str, access_token: str, indent: str = "") -> None:
     q = urllib.parse.quote(f"'{parent_id}' in parents and trashed = false")
     files = []
     page_token = ""
@@ -52,7 +54,7 @@ def walk(parent_id: str, indent: str = "") -> None:
         )
         if page_token:
             url += "&pageToken=" + urllib.parse.quote(page_token)
-        res = gget(url)
+        res = gget(url, access_token)
         files.extend(res.get("files", []))
         page_token = res.get("nextPageToken", "")
         if not page_token:
@@ -62,11 +64,18 @@ def walk(parent_id: str, indent: str = "") -> None:
     for f in files:
         if f["mimeType"] == "application/vnd.google-apps.folder":
             print(f"{indent}[Folder] {f['name']}/  (id={f['id']})")
-            walk(f["id"], indent + "  ")
+            walk(f["id"], access_token, indent + "  ")
         else:
             mb = int(f.get("size", 0)) / 1048576
             print(f"{indent}{f['name']:36s}  {mb:6.2f} MB  (id={f['id']})")
 
 
-print("Google Drive tree under CCTV/:")
-walk(cfg["folder_id"], "  ")
+def main() -> None:
+    cfg = json.loads((pathlib.Path(__file__).with_name("gdrive.json")).read_text(encoding="utf-8"))
+    access_token = fetch_access_token(cfg)
+    print("Google Drive tree under CCTV/:")
+    walk(cfg["folder_id"], access_token, "  ")
+
+
+if __name__ == "__main__":
+    main()

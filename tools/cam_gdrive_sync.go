@@ -82,18 +82,14 @@ func logf(format string, args ...interface{}) {
 	}
 
 	logMu.Lock()
-	path := logFilePath
-	logMu.Unlock()
+	defer logMu.Unlock()
 
-	if path == "" {
+	if logFilePath == "" {
 		fmt.Print(msg)
 		return
 	}
 
-	logMu.Lock()
-	defer logMu.Unlock()
-
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	f, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		fmt.Print(msg)
 		return
@@ -101,15 +97,15 @@ func logf(format string, args ...interface{}) {
 	_, _ = f.WriteString(msg)
 	f.Close()
 
-	if st, err := os.Stat(path); err == nil && st.Size() > maxLogBytes {
-		if b, err := os.ReadFile(path); err == nil && len(b) > keepLogBytes {
+	if st, err := os.Stat(logFilePath); err == nil && st.Size() > maxLogBytes {
+		if b, err := os.ReadFile(logFilePath); err == nil && len(b) > keepLogBytes {
 			tail := b[len(b)-keepLogBytes:]
 			if idx := bytes.IndexByte(tail, '\n'); idx >= 0 && idx+1 < len(tail) {
 				tail = tail[idx+1:]
 			}
-			tmp := path + ".tmp"
+			tmp := logFilePath + ".tmp"
 			if os.WriteFile(tmp, tail, 0644) == nil {
-				_ = os.Rename(tmp, path)
+				_ = os.Rename(tmp, logFilePath)
 			}
 		}
 	}
@@ -192,6 +188,13 @@ func initHTTP(caFile string) error {
 	return nil
 }
 
+func setFolderCache(key, id string) {
+	if len(folderCache) >= 200 {
+		folderCache = make(map[string]string)
+	}
+	folderCache[key] = id
+}
+
 func invalidateToken() {
 	cachedToken = ""
 	tokenExpiry = time.Time{}
@@ -237,8 +240,8 @@ func backoffDelay(try int, retryAfter string) time.Duration {
 		shift = 5
 	}
 	d := (500 * time.Millisecond) << shift
-	if d > 10*time.Second {
-		d = 10 * time.Second
+	if d > 15*time.Second {
+		d = 15 * time.Second
 	}
 	return d
 }
@@ -303,7 +306,9 @@ func ensureSubfolder(cfg *Config, parentID, name string) (string, error) {
 		req.Header.Set("Authorization", "Bearer "+token)
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			return "", err
+			lastErr = err
+			sleepFunc(backoffDelay(try, ""))
+			continue
 		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 		resp.Body.Close()
@@ -313,7 +318,7 @@ func ensureSubfolder(cfg *Config, parentID, name string) (string, error) {
 				return "", fmt.Errorf("ensureSubfolder(%s) decode: %w", name, err)
 			}
 			if len(list.Files) > 0 {
-				folderCache[cacheKey] = list.Files[0].ID
+				setFolderCache(cacheKey, list.Files[0].ID)
 				return list.Files[0].ID, nil
 			}
 			gotEmptyList = true
@@ -360,7 +365,9 @@ func ensureSubfolder(cfg *Config, parentID, name string) (string, error) {
 		creq.Header.Set("Content-Type", "application/json")
 		cresp, err := httpClient.Do(creq)
 		if err != nil {
-			return "", err
+			lastErr = err
+			sleepFunc(backoffDelay(try, ""))
+			continue
 		}
 		cbody, _ := io.ReadAll(io.LimitReader(cresp.Body, 64*1024))
 		cresp.Body.Close()
@@ -369,7 +376,7 @@ func ensureSubfolder(cfg *Config, parentID, name string) (string, error) {
 			if err := json.Unmarshal(cbody, &df); err != nil {
 				return "", err
 			}
-			folderCache[cacheKey] = df.ID
+			setFolderCache(cacheKey, df.ID)
 			return df.ID, nil
 		}
 		if cresp.StatusCode == 401 && !refreshed {
@@ -407,7 +414,9 @@ func deleteDriveObject(cfg *Config, fileID string) error {
 		req.Header.Set("Authorization", "Bearer "+token)
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			return err
+			lastErr = err
+			sleepFunc(backoffDelay(try, ""))
+			continue
 		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 		resp.Body.Close()
@@ -461,7 +470,9 @@ func driveListFiles(cfg *Config, query, fields string) ([]DriveFile, error) {
 			req.Header.Set("Authorization", "Bearer "+token)
 			resp, err := httpClient.Do(req)
 			if err != nil {
-				return nil, err
+				lastErr = err
+				sleepFunc(backoffDelay(try, ""))
+				continue
 			}
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
 			resp.Body.Close()
@@ -498,6 +509,18 @@ func driveListFiles(cfg *Config, query, fields string) ([]DriveFile, error) {
 	return all, nil
 }
 
+func driveFileExists(cfg *Config, folderID, name string) (bool, error) {
+	q := fmt.Sprintf("name = '%s' and trashed = false", escapeDriveQueryValue(name))
+	if folderID != "" {
+		q += fmt.Sprintf(" and '%s' in parents", escapeDriveQueryValue(folderID))
+	}
+	files, err := driveListFiles(cfg, q, "files(id,name)")
+	if err != nil {
+		return false, err
+	}
+	return len(files) > 0, nil
+}
+
 func initResumableUpload(cfg *Config, folderID, remoteName string, totalSize int64) (string, error) {
 	meta := map[string]interface{}{
 		"name": remoteName,
@@ -527,7 +550,9 @@ func initResumableUpload(cfg *Config, folderID, remoteName string, totalSize int
 
 		initResp, err := httpClient.Do(initReq)
 		if err != nil {
-			return "", fmt.Errorf("init resumable: %w", err)
+			lastErr = fmt.Errorf("init resumable: %w", err)
+			sleepFunc(backoffDelay(try, ""))
+			continue
 		}
 		body, _ := io.ReadAll(io.LimitReader(initResp.Body, 8192))
 		initResp.Body.Close()
@@ -542,6 +567,9 @@ func initResumableUpload(cfg *Config, folderID, remoteName string, totalSize int
 			refreshed = true
 			continue
 		} else {
+			if initResp.StatusCode == 404 {
+				folderCache = make(map[string]string)
+			}
 			lastErr = fmt.Errorf("init resumable HTTP %d: %s", initResp.StatusCode, snippet(body))
 			if !isRetryableHTTPStatus(initResp.StatusCode, body) {
 				return "", lastErr
@@ -658,7 +686,12 @@ func uploadStreamResumable(uploadURL string, src io.Reader) (string, error) {
 				resp, err := httpClient.Do(req)
 				if err != nil {
 					lastErr = err
-					sleepFunc(backoffDelay(try, ""))
+					sendZeroByte = true
+					d := backoffDelay(try, "")
+					if d > 15*time.Second {
+						d = 15 * time.Second
+					}
+					sleepFunc(d)
 					continue
 				}
 				body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
@@ -675,12 +708,12 @@ func uploadStreamResumable(uploadURL string, src io.Reader) (string, error) {
 					if !isRetryableHTTPStatus(resp.StatusCode, body) {
 						return "", lastErr
 					}
-					// Toggle between re-sending final chunk and 0-byte commit query
-					sendZeroByte = !sendZeroByte
+					// Probe with a 0-byte query only after 5xx/network errors; keep retrying full chunk on 403/429 rate-limits.
+					sendZeroByte = resp.StatusCode >= 500 && resp.StatusCode <= 599
 				}
 				d := backoffDelay(try, resp.Header.Get("Retry-After"))
-				if d > 5*time.Second {
-					d = 5 * time.Second
+				if d > 15*time.Second {
+					d = 15 * time.Second
 				}
 				sleepFunc(d)
 			}
@@ -814,6 +847,23 @@ func (wt *writeTracker) Write(p []byte) (int, error) {
 	return n, err
 }
 
+func padZeroes(wt *writeTracker, count int64, buf []byte) error {
+	for i := range buf {
+		buf[i] = 0
+	}
+	for count > 0 {
+		n := int64(len(buf))
+		if count < n {
+			n = count
+		}
+		if _, err := wt.Write(buf[:n]); err != nil {
+			return err
+		}
+		count -= n
+	}
+	return nil
+}
+
 func mergeOneClip(w io.Writer, path string, copyBuf []byte, moofBuf *[]byte, wroteInit *bool, seqNum *uint32, offsetMS uint64) (uint64, error) {
 	dropPageCache()
 	f, err := os.Open(path)
@@ -825,15 +875,22 @@ func mergeOneClip(w io.Writer, path string, copyBuf []byte, moofBuf *[]byte, wro
 		dropPageCache()
 	}()
 
+	fileSize := int64(-1)
+	if st, err := f.Stat(); err == nil {
+		fileSize = st.Size()
+	}
+
 	br := bufio.NewReaderSize(&cacheDroppingReader{r: f}, 32*1024)
 	wt := &writeTracker{w: w}
 	fileMaxEnd := offsetMS
+	var filePos int64
 	var hdr [8]byte
 
 	for {
 		if _, err := io.ReadFull(br, hdr[:]); err != nil {
 			return fileMaxEnd, nil
 		}
+		filePos += 8
 		sz := int64(binary.BigEndian.Uint32(hdr[0:4]))
 		typ := string(hdr[4:8])
 		if sz < 8 || sz > 32*1024*1024 {
@@ -844,20 +901,33 @@ func mergeOneClip(w io.Writer, path string, copyBuf []byte, moofBuf *[]byte, wro
 		switch typ {
 		case "ftyp", "free", "moov":
 			if !*wroteInit {
+				if fileSize >= 0 && filePos+payloadLen > fileSize {
+					return fileMaxEnd, nil
+				}
 				if _, err := wt.Write(hdr[:]); err != nil {
 					return fileMaxEnd, err
 				}
-				if _, err := io.CopyBuffer(wt, io.LimitReader(br, payloadLen), copyBuf); err != nil {
-					if wt.err != nil {
-						return fileMaxEnd, wt.err
+				n, err := io.CopyBuffer(wt, io.LimitReader(br, payloadLen), copyBuf)
+				filePos += n
+				if wt.err != nil {
+					return fileMaxEnd, wt.err
+				}
+				if n < payloadLen {
+					if perr := padZeroes(wt, payloadLen-n, copyBuf); perr != nil {
+						return fileMaxEnd, perr
 					}
+					return fileMaxEnd, nil
+				}
+				if err != nil {
 					return fileMaxEnd, nil
 				}
 				if typ == "moov" {
 					*wroteInit = true
 				}
 			} else {
-				if _, err := io.CopyBuffer(io.Discard, io.LimitReader(br, payloadLen), copyBuf); err != nil {
+				n, err := io.CopyBuffer(io.Discard, io.LimitReader(br, payloadLen), copyBuf)
+				filePos += n
+				if err != nil || n < payloadLen {
 					return fileMaxEnd, nil
 				}
 			}
@@ -873,6 +943,7 @@ func mergeOneClip(w io.Writer, path string, copyBuf []byte, moofBuf *[]byte, wro
 			if _, err := io.ReadFull(br, buf[8:]); err != nil {
 				return fileMaxEnd, nil
 			}
+			filePos += payloadLen
 			endDT := patchMoof(buf, *seqNum, offsetMS)
 			*seqNum++
 			if endDT > fileMaxEnd {
@@ -882,17 +953,35 @@ func mergeOneClip(w io.Writer, path string, copyBuf []byte, moofBuf *[]byte, wro
 				return fileMaxEnd, err
 			}
 		case "mdat":
+			if fileSize >= 0 && filePos+payloadLen > fileSize {
+				rem := fileSize - filePos
+				if rem < 0 {
+					return fileMaxEnd, nil
+				}
+				payloadLen = rem
+				binary.BigEndian.PutUint32(hdr[0:4], uint32(8+payloadLen))
+			}
 			if _, err := wt.Write(hdr[:]); err != nil {
 				return fileMaxEnd, err
 			}
-			if _, err := io.CopyBuffer(wt, io.LimitReader(br, payloadLen), copyBuf); err != nil {
-				if wt.err != nil {
-					return fileMaxEnd, wt.err
+			n, err := io.CopyBuffer(wt, io.LimitReader(br, payloadLen), copyBuf)
+			filePos += n
+			if wt.err != nil {
+				return fileMaxEnd, wt.err
+			}
+			if n < payloadLen {
+				if perr := padZeroes(wt, payloadLen-n, copyBuf); perr != nil {
+					return fileMaxEnd, perr
 				}
 				return fileMaxEnd, nil
 			}
+			if err != nil {
+				return fileMaxEnd, nil
+			}
 		default:
-			if _, err := io.CopyBuffer(io.Discard, io.LimitReader(br, payloadLen), copyBuf); err != nil {
+			n, err := io.CopyBuffer(io.Discard, io.LimitReader(br, payloadLen), copyBuf)
+			filePos += n
+			if err != nil || n < payloadLen {
 				return fileMaxEnd, nil
 			}
 		}
@@ -1236,7 +1325,6 @@ func main() {
 	var lastClientID, lastClientSecret, lastRefreshToken string
 
 	for {
-		dropPageCache()
 		cfgBytes, err := os.ReadFile(cfgPath)
 		if err != nil {
 			logf("[wait] waiting for config %s: %v", cfgPath, err)
@@ -1321,6 +1409,7 @@ func main() {
 		}
 
 		// 1. Current active 3-hour block -> upload each new 5-minute clip immediately to CCTV / YYYY-MM / DD / live_<block> /
+		liveFailed := false
 		if activeClips, ok := blockMap[activeBlock]; ok {
 			for i := len(activeClips) - 1; i >= 0; i-- {
 				c := activeClips[i]
@@ -1330,16 +1419,19 @@ func main() {
 				monthID, err := ensureSubfolder(&cfg, rootID, c.MonthName)
 				if err != nil {
 					logf("[err] month folder %s: %v", c.MonthName, err)
+					liveFailed = true
 					break
 				}
 				dayID, err := ensureSubfolder(&cfg, monthID, c.DayName)
 				if err != nil {
 					logf("[err] day folder %s: %v", c.DayName, err)
+					liveFailed = true
 					break
 				}
 				liveFolderID, err := ensureSubfolder(&cfg, dayID, "live_"+c.BlockName)
 				if err != nil {
 					logf("[err] live folder %s: %v", c.BlockName, err)
+					liveFailed = true
 					break
 				}
 				logf("[live] uploading %s/%s/live_%s/%s ...", c.MonthName, c.DayName, c.BlockName, c.LiveName)
@@ -1347,6 +1439,7 @@ func main() {
 				id, err := uploadSingleFile(&cfg, liveFolderID, c.FullPath, c.LiveName)
 				if err != nil {
 					logf("[err] live upload %s: %v", c.LiveName, err)
+					liveFailed = true
 					break
 				}
 				logf("[ok-live] uploaded %s -> id=%s in %s", c.LiveName, id, time.Since(t0).Round(time.Millisecond))
@@ -1357,44 +1450,54 @@ func main() {
 		}
 
 		// 2. Completed 3-hour blocks -> stream-merge into CCTV / YYYY-MM / DD / HH-HH.mp4
-		for _, bKey := range blockOrder {
-			if bKey == activeBlock || uploaded[bKey] {
-				continue
-			}
-			bClips := blockMap[bKey]
-			if len(bClips) == 0 {
-				continue
-			}
-			c0 := bClips[0]
-			monthID, err := ensureSubfolder(&cfg, rootID, c0.MonthName)
-			if err != nil {
-				logf("[err] month folder %s: %v", c0.MonthName, err)
-				break
-			}
-			dayID, err := ensureSubfolder(&cfg, monthID, c0.DayName)
-			if err != nil {
-				logf("[err] day folder %s: %v", c0.DayName, err)
-				break
-			}
-			var filePaths []string
-			for _, c := range bClips {
-				filePaths = append(filePaths, c.FullPath)
-			}
-			logf("[merge] stream-merging %d clips -> %s/%s/%s.mp4 ...", len(filePaths), c0.MonthName, c0.DayName, c0.BlockName)
-			t0 := time.Now()
-			id, err := uploadMergedBlock(&cfg, dayID, c0.BlockName, filePaths)
-			if err != nil {
-				logf("[err] merge %s: %v", bKey, err)
-				break
-			}
-			logf("[ok-merge] uploaded %s/%s/%s.mp4 -> id=%s in %s", c0.MonthName, c0.DayName, c0.BlockName, id, time.Since(t0).Round(time.Millisecond))
-			uploaded[bKey] = true
-			appendUploaded(cfg.StateFile, bKey)
+		if !liveFailed {
+			for _, bKey := range blockOrder {
+				if bKey == activeBlock || uploaded[bKey] {
+					continue
+				}
+				bClips := blockMap[bKey]
+				if len(bClips) == 0 {
+					continue
+				}
+				c0 := bClips[0]
+				monthID, err := ensureSubfolder(&cfg, rootID, c0.MonthName)
+				if err != nil {
+					logf("[err] month folder %s: %v", c0.MonthName, err)
+					break
+				}
+				dayID, err := ensureSubfolder(&cfg, monthID, c0.DayName)
+				if err != nil {
+					logf("[err] day folder %s: %v", c0.DayName, err)
+					break
+				}
+				remoteName := c0.BlockName + ".mp4"
+				if exists, err := driveFileExists(&cfg, dayID, remoteName); err == nil && exists {
+					logf("[skip-merge] %s/%s/%s already exists in Drive", c0.MonthName, c0.DayName, remoteName)
+					uploaded[bKey] = true
+					appendUploaded(cfg.StateFile, bKey)
+					cleanupLiveFolder(&cfg, dayID, c0.BlockName)
+					continue
+				}
+				var filePaths []string
+				for _, c := range bClips {
+					filePaths = append(filePaths, c.FullPath)
+				}
+				logf("[merge] stream-merging %d clips -> %s/%s/%s ...", len(filePaths), c0.MonthName, c0.DayName, remoteName)
+				t0 := time.Now()
+				id, err := uploadMergedBlock(&cfg, dayID, c0.BlockName, filePaths)
+				if err != nil {
+					logf("[err] merge %s: %v", bKey, err)
+					break
+				}
+				logf("[ok-merge] uploaded %s/%s/%s -> id=%s in %s", c0.MonthName, c0.DayName, remoteName, id, time.Since(t0).Round(time.Millisecond))
+				uploaded[bKey] = true
+				appendUploaded(cfg.StateFile, bKey)
 
-			// Delete temporary live_<block> folder once the merged 3-hour video is uploaded
-			cleanupLiveFolder(&cfg, dayID, c0.BlockName)
-			runtime.GC()
-			break
+				// Delete temporary live_<block> folder once the merged 3-hour video is uploaded
+				cleanupLiveFolder(&cfg, dayID, c0.BlockName)
+				runtime.GC()
+				break
+			}
 		}
 
 		deleteOldDriveFiles(&cfg, rootID, cfg.RetentionHrs, tzOff)
