@@ -56,11 +56,11 @@ After a normal boot, telnet to the camera on port 23 as `root` with `NEWPW`. The
 The uploader does not fit in the 384 KB config partition, so it lives on the SD card.
 
 ```bash
-sudo bash tools/build.sh
+bash tools/build.sh
 copy tools\gdrive.json.example tools\gdrive.json
 ```
 
-Edit `tools/gdrive.json` with your client id, client secret, refresh token, and the Drive folder id. Set `retention_hours` from your own free space. The camera records about 4.5–5 GB a day, so `hours = (free GB / 5) × 24`. The `2160` in the example is 90 days and only fits a large plan. A 15 GB free account should use about `72`. Use your own Google Cloud OAuth client. A shared public client gets rate-limited.
+Edit `tools/gdrive.json` with your client id, client secret, refresh token, and the Drive folder id. Set `retention_hours` from your own free space (the example defaults to `72`, about 3 days on a 15 GB free account). The camera records about 4.5–5 GB a day, so `hours = (free GB / 5) × 24`. Use your own Google Cloud OAuth client. A shared public client gets rate-limited.
 
 From the PC on the same LAN:
 
@@ -84,6 +84,7 @@ This camera has about 32 MB of RAM, and recording already uses most of it. The u
 - A finished 3-hour block is merged while it is uploaded. There is no second copy on the SD card and no re-encode.
 - The directory walk looks at the last 72 hours only, so a full 128 GB card is not loaded into the process.
 - `/conf/uploaded_v2.log` is trimmed when it passes 8 KB, so the small config partition does not fill up.
+- `/tmp/gdrive.log` is self-capped at 32 KB while running so logs do not fill `/tmp` in RAM.
 - `custom.sh` takes a lock, so a second copy exits instead of stacking. If the uploader quits, the loop starts it again after 20 seconds.
 
 Watch it with `free` over telnet while a clip uploads. `cam_gdrive_sync` should stay near that 5 MB cap, and the camera should keep recording. If your board has less free RAM than this one, do not raise the heap limit to "make uploads faster."

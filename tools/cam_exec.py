@@ -19,43 +19,50 @@ timeout = float(sys.argv[2]) if len(sys.argv) > 2 else 30.0
 if not PASS:
     raise SystemExit("Set CAM_PASS to the camera root password.")
 
+
+def read_until(sock: socket.socket, markers: tuple[bytes, ...], wait: float) -> bytes:
+    buf = b""
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        sock.settimeout(max(0.05, deadline - time.time()))
+        try:
+            c = sock.recv(4096)
+            if not c:
+                break
+            buf += c
+            lower = buf.lower()
+            if any(m in lower for m in markers):
+                break
+        except socket.timeout:
+            break
+    return buf
+
+
 s = socket.create_connection((HOST, 23), timeout=5)
-s.settimeout(1.0)
+try:
+    read_until(s, (b"login:",), 2.5)
+    s.sendall((USER + "\r\n").encode())
+    read_until(s, (b"password:",), 2.5)
+    s.sendall((PASS + "\r\n").encode())
+    auth_out = read_until(s, (b"# ", b"$ ", b"login incorrect"), 2.5)
+    if b"login incorrect" in auth_out.lower():
+        print("Telnet login failed: Login incorrect", file=sys.stderr)
+        sys.exit(1)
 
-
-def drain(wait=0.5):
-    time.sleep(wait)
+    s.sendall((cmd + "\nexit\n").encode())
+    s.settimeout(timeout)
     out = b""
-    while True:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
         try:
             c = s.recv(4096)
             if not c:
                 break
             out += c
+        except socket.timeout:
+            break
         except Exception:
             break
-    return out
-
-
-drain(0.4)
-s.sendall((USER + "\r\n").encode())
-drain(0.4)
-s.sendall((PASS + "\r\n").encode())
-drain(0.5)
-s.sendall((cmd + "\nexit\n").encode())
-
-s.settimeout(timeout)
-out = b""
-deadline = time.time() + timeout
-while time.time() < deadline:
-    try:
-        c = s.recv(4096)
-        if not c:
-            break
-        out += c
-    except socket.timeout:
-        break
-    except Exception:
-        break
-s.close()
-print(out.decode("utf-8", "replace"))
+    print(out.decode("utf-8", "replace"))
+finally:
+    s.close()

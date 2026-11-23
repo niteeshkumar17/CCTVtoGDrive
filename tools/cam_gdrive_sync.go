@@ -18,20 +18,22 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 type Config struct {
-	ClientID     string `json:"client_id"`
-	ClientSecret string `json:"client_secret"`
-	RefreshToken string `json:"refresh_token"`
-	FolderID     string `json:"folder_id"`
-	FolderName   string `json:"folder_name"`
-	RetentionHrs int    `json:"retention_hours"`
-	MediaDir     string `json:"media_dir"`
-	StateFile    string `json:"state_file"`
-	CACertFile   string `json:"ca_cert_file"`
-	PollSeconds  int    `json:"poll_seconds"`
+	ClientID        string `json:"client_id"`
+	ClientSecret    string `json:"client_secret"`
+	RefreshToken    string `json:"refresh_token"`
+	FolderID        string `json:"folder_id"`
+	FolderName      string `json:"folder_name"`
+	RetentionHrs    int    `json:"retention_hours"`
+	TZOffsetMinutes *int   `json:"tz_offset_minutes,omitempty"`
+	MediaDir        string `json:"media_dir"`
+	StateFile       string `json:"state_file"`
+	CACertFile      string `json:"ca_cert_file"`
+	PollSeconds     int    `json:"poll_seconds"`
 }
 
 type TokenResp struct {
@@ -47,18 +49,98 @@ type DriveFile struct {
 }
 
 type DriveListResp struct {
-	Files []DriveFile `json:"files"`
+	NextPageToken string      `json:"nextPageToken"`
+	Files         []DriveFile `json:"files"`
 }
 
-const scottyChunkSize = 512 * 1024 // 524,288 bytes (2 * 256 KiB, required by Google Scotty)
+const (
+	scottyChunkSize = 512 * 1024 // 524,288 bytes (2 * 256 KiB, required by Google Scotty)
+	maxMoofSize     = 1 * 1024 * 1024
+	maxLogBytes     = 32 * 1024
+	keepLogBytes    = 16 * 1024
+)
 
 var (
+	driveAPIBase  = "https://www.googleapis.com"
+	oauthTokenURL = "https://oauth2.googleapis.com/token"
+	sleepFunc     = time.Sleep
+
 	httpClient  *http.Client
 	cachedToken string
 	tokenExpiry time.Time
 	folderCache = make(map[string]string)
 	scottyBuf   = make([]byte, scottyChunkSize)
+
+	logMu       sync.Mutex
+	logFilePath string
 )
+
+func logf(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	if !strings.HasSuffix(msg, "\n") {
+		msg += "\n"
+	}
+
+	logMu.Lock()
+	path := logFilePath
+	logMu.Unlock()
+
+	if path == "" {
+		fmt.Print(msg)
+		return
+	}
+
+	logMu.Lock()
+	defer logMu.Unlock()
+
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		fmt.Print(msg)
+		return
+	}
+	_, _ = f.WriteString(msg)
+	f.Close()
+
+	if st, err := os.Stat(path); err == nil && st.Size() > maxLogBytes {
+		if b, err := os.ReadFile(path); err == nil && len(b) > keepLogBytes {
+			tail := b[len(b)-keepLogBytes:]
+			if idx := bytes.IndexByte(tail, '\n'); idx >= 0 && idx+1 < len(tail) {
+				tail = tail[idx+1:]
+			}
+			tmp := path + ".tmp"
+			if os.WriteFile(tmp, tail, 0644) == nil {
+				_ = os.Rename(tmp, path)
+			}
+		}
+	}
+}
+
+func tzOffsetMinutes(cfg *Config) int {
+	if cfg == nil || cfg.TZOffsetMinutes == nil {
+		return 330
+	}
+	return *cfg.TZOffsetMinutes
+}
+
+func cameraNow(tzOffsetMin int) time.Time {
+	return time.Now().UTC().Add(time.Duration(tzOffsetMin) * time.Minute)
+}
+
+func validateConfig(cfg *Config) error {
+	if strings.TrimSpace(cfg.ClientID) == "" {
+		return fmt.Errorf("missing client_id")
+	}
+	if strings.TrimSpace(cfg.ClientSecret) == "" {
+		return fmt.Errorf("missing client_secret")
+	}
+	if strings.TrimSpace(cfg.RefreshToken) == "" {
+		return fmt.Errorf("missing refresh_token")
+	}
+	if strings.TrimSpace(cfg.FolderID) == "" && strings.TrimSpace(cfg.FolderName) == "" {
+		return fmt.Errorf("missing folder_id or folder_name")
+	}
+	return nil
+}
 
 func dropPageCache() {
 	_ = os.WriteFile("/proc/sys/vm/drop_caches", []byte("1\n"), 0644)
@@ -93,8 +175,6 @@ func initHTTP(caFile string) error {
 			return fmt.Errorf("failed to parse CA bundle")
 		}
 		tlsCfg.RootCAs = pool
-	} else {
-		tlsCfg.InsecureSkipVerify = true
 	}
 	httpClient = &http.Client{
 		Timeout: 120 * time.Second,
@@ -112,6 +192,57 @@ func initHTTP(caFile string) error {
 	return nil
 }
 
+func invalidateToken() {
+	cachedToken = ""
+	tokenExpiry = time.Time{}
+}
+
+func snippet(b []byte) string {
+	s := strings.TrimSpace(string(b))
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	if len(s) > 200 {
+		return s[:200] + "..."
+	}
+	return s
+}
+
+func escapeDriveQueryValue(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	return strings.ReplaceAll(s, `'`, `\'`)
+}
+
+func isRetryableHTTPStatus(code int, body []byte) bool {
+	if code == 429 || (code >= 500 && code <= 599) {
+		return true
+	}
+	if code == 403 {
+		return !bytes.Contains(body, []byte("storageQuotaExceeded"))
+	}
+	return false
+}
+
+func backoffDelay(try int, retryAfter string) time.Duration {
+	if retryAfter != "" {
+		if sec, err := strconv.Atoi(strings.TrimSpace(retryAfter)); err == nil && sec > 0 {
+			d := time.Duration(sec) * time.Second
+			if d > 30*time.Second {
+				d = 30 * time.Second
+			}
+			return d
+		}
+	}
+	shift := try
+	if shift > 5 {
+		shift = 5
+	}
+	d := (500 * time.Millisecond) << shift
+	if d > 10*time.Second {
+		d = 10 * time.Second
+	}
+	return d
+}
+
 func getAccessToken(cfg *Config) (string, error) {
 	if cachedToken != "" && time.Now().Before(tokenExpiry) {
 		return cachedToken, nil
@@ -122,18 +253,21 @@ func getAccessToken(cfg *Config) (string, error) {
 		"refresh_token": {cfg.RefreshToken},
 		"grant_type":    {"refresh_token"},
 	}
-	resp, err := httpClient.PostForm("https://oauth2.googleapis.com/token", vals)
+	resp, err := httpClient.PostForm(oauthTokenURL, vals)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("token HTTP %d", resp.StatusCode)
+		return "", fmt.Errorf("token HTTP %d: %s", resp.StatusCode, snippet(body))
 	}
 	var tr TokenResp
 	if err := json.Unmarshal(body, &tr); err != nil {
 		return "", err
+	}
+	if tr.AccessToken == "" {
+		return "", fmt.Errorf("empty access_token in response")
 	}
 	cachedToken = tr.AccessToken
 	exp := tr.ExpiresIn
@@ -144,40 +278,65 @@ func getAccessToken(cfg *Config) (string, error) {
 	return cachedToken, nil
 }
 
-func ensureSubfolder(token, parentID, name string) (string, error) {
+func ensureSubfolder(cfg *Config, parentID, name string) (string, error) {
 	cacheKey := parentID + "/" + name
 	if id, ok := folderCache[cacheKey]; ok && id != "" {
 		return id, nil
 	}
-	q := fmt.Sprintf("mimeType = 'application/vnd.google-apps.folder' and name = '%s' and trashed = false", name)
+	q := fmt.Sprintf("mimeType = 'application/vnd.google-apps.folder' and name = '%s' and trashed = false", escapeDriveQueryValue(name))
 	if parentID != "" {
-		q += fmt.Sprintf(" and '%s' in parents", parentID)
+		q += fmt.Sprintf(" and '%s' in parents", escapeDriveQueryValue(parentID))
 	}
-	u := "https://www.googleapis.com/drive/v3/files?pageSize=1&fields=files(id,name)&q=" + url.QueryEscape(q)
+	u := driveAPIBase + "/drive/v3/files?pageSize=1&fields=files(id,name)&q=" + url.QueryEscape(q)
 	gotEmptyList := false
-	for try := 0; try < 100; try++ {
-		req, _ := http.NewRequest("GET", u, nil)
+	refreshed := false
+	var lastErr error
+	for try := 0; try < 20; try++ {
+		token, err := getAccessToken(cfg)
+		if err != nil {
+			return "", err
+		}
+		req, err := http.NewRequest("GET", u, nil)
+		if err != nil {
+			return "", err
+		}
 		req.Header.Set("Authorization", "Bearer "+token)
 		resp, err := httpClient.Do(req)
 		if err != nil {
 			return "", err
 		}
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 		resp.Body.Close()
 		if resp.StatusCode == 200 {
 			var list DriveListResp
-			if json.Unmarshal(body, &list) == nil && len(list.Files) > 0 {
+			if err := json.Unmarshal(body, &list); err != nil {
+				return "", fmt.Errorf("ensureSubfolder(%s) decode: %w", name, err)
+			}
+			if len(list.Files) > 0 {
 				folderCache[cacheKey] = list.Files[0].ID
 				return list.Files[0].ID, nil
 			}
 			gotEmptyList = true
 			break
 		}
-		time.Sleep(500 * time.Millisecond)
+		if resp.StatusCode == 401 && !refreshed {
+			invalidateToken()
+			refreshed = true
+			continue
+		}
+		lastErr = fmt.Errorf("ensureSubfolder(%s) GET HTTP %d: %s", name, resp.StatusCode, snippet(body))
+		if !isRetryableHTTPStatus(resp.StatusCode, body) {
+			return "", lastErr
+		}
+		sleepFunc(backoffDelay(try, resp.Header.Get("Retry-After")))
 	}
 	if !gotEmptyList {
-		return "", fmt.Errorf("ensureSubfolder(%s) GET rate-limited", name)
+		if lastErr != nil {
+			return "", lastErr
+		}
+		return "", fmt.Errorf("ensureSubfolder(%s) GET retries exhausted", name)
 	}
+
 	meta := map[string]interface{}{
 		"name":     name,
 		"mimeType": "application/vnd.google-apps.folder",
@@ -186,15 +345,24 @@ func ensureSubfolder(token, parentID, name string) (string, error) {
 		meta["parents"] = []string{parentID}
 	}
 	mb, _ := json.Marshal(meta)
-	for try := 0; try < 50; try++ {
-		creq, _ := http.NewRequest("POST", "https://www.googleapis.com/drive/v3/files", bytes.NewReader(mb))
+	refreshed = false
+	lastErr = nil
+	for try := 0; try < 15; try++ {
+		token, err := getAccessToken(cfg)
+		if err != nil {
+			return "", err
+		}
+		creq, err := http.NewRequest("POST", driveAPIBase+"/drive/v3/files", bytes.NewReader(mb))
+		if err != nil {
+			return "", err
+		}
 		creq.Header.Set("Authorization", "Bearer "+token)
 		creq.Header.Set("Content-Type", "application/json")
 		cresp, err := httpClient.Do(creq)
 		if err != nil {
 			return "", err
 		}
-		cbody, _ := io.ReadAll(cresp.Body)
+		cbody, _ := io.ReadAll(io.LimitReader(cresp.Body, 64*1024))
 		cresp.Body.Close()
 		if cresp.StatusCode == 200 || cresp.StatusCode == 201 {
 			var df DriveFile
@@ -204,22 +372,44 @@ func ensureSubfolder(token, parentID, name string) (string, error) {
 			folderCache[cacheKey] = df.ID
 			return df.ID, nil
 		}
-		time.Sleep(500 * time.Millisecond)
+		if cresp.StatusCode == 401 && !refreshed {
+			invalidateToken()
+			refreshed = true
+			continue
+		}
+		lastErr = fmt.Errorf("ensureSubfolder(%s) POST HTTP %d: %s", name, cresp.StatusCode, snippet(cbody))
+		if !isRetryableHTTPStatus(cresp.StatusCode, cbody) {
+			return "", lastErr
+		}
+		sleepFunc(backoffDelay(try, cresp.Header.Get("Retry-After")))
 	}
-	return "", fmt.Errorf("ensureSubfolder(%s) rate-limited", name)
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", fmt.Errorf("ensureSubfolder(%s) POST retries exhausted", name)
 }
 
-func deleteDriveObject(token, fileID string) {
+func deleteDriveObject(cfg *Config, fileID string) error {
 	if fileID == "" {
-		return
+		return nil
 	}
-	for try := 0; try < 30; try++ {
-		req, _ := http.NewRequest("DELETE", "https://www.googleapis.com/drive/v3/files/"+fileID, nil)
+	refreshed := false
+	var lastErr error
+	for try := 0; try < 15; try++ {
+		token, err := getAccessToken(cfg)
+		if err != nil {
+			return err
+		}
+		req, err := http.NewRequest("DELETE", driveAPIBase+"/drive/v3/files/"+fileID, nil)
+		if err != nil {
+			return err
+		}
 		req.Header.Set("Authorization", "Bearer "+token)
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			return
+			return err
 		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 		resp.Body.Close()
 		if resp.StatusCode == 204 || resp.StatusCode == 200 || resp.StatusCode == 404 {
 			for k, v := range folderCache {
@@ -227,13 +417,88 @@ func deleteDriveObject(token, fileID string) {
 					delete(folderCache, k)
 				}
 			}
-			return
+			return nil
 		}
-		time.Sleep(500 * time.Millisecond)
+		if resp.StatusCode == 401 && !refreshed {
+			invalidateToken()
+			refreshed = true
+			continue
+		}
+		lastErr = fmt.Errorf("DELETE %s HTTP %d: %s", fileID, resp.StatusCode, snippet(body))
+		if !isRetryableHTTPStatus(resp.StatusCode, body) {
+			return lastErr
+		}
+		sleepFunc(backoffDelay(try, resp.Header.Get("Retry-After")))
 	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return fmt.Errorf("DELETE %s retries exhausted", fileID)
 }
 
-func initResumableUpload(token, folderID, remoteName string, totalSize int64) (string, error) {
+func driveListFiles(cfg *Config, query, fields string) ([]DriveFile, error) {
+	var all []DriveFile
+	pageToken := ""
+	fullFields := "nextPageToken," + fields
+	for {
+		u := driveAPIBase + "/drive/v3/files?pageSize=100&fields=" + url.QueryEscape(fullFields) + "&q=" + url.QueryEscape(query)
+		if pageToken != "" {
+			u += "&pageToken=" + url.QueryEscape(pageToken)
+		}
+		var pageResp DriveListResp
+		ok := false
+		refreshed := false
+		var lastErr error
+		for try := 0; try < 15; try++ {
+			token, err := getAccessToken(cfg)
+			if err != nil {
+				return nil, err
+			}
+			req, err := http.NewRequest("GET", u, nil)
+			if err != nil {
+				return nil, err
+			}
+			req.Header.Set("Authorization", "Bearer "+token)
+			resp, err := httpClient.Do(req)
+			if err != nil {
+				return nil, err
+			}
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+			resp.Body.Close()
+			if resp.StatusCode == 200 {
+				if err := json.Unmarshal(body, &pageResp); err != nil {
+					return nil, fmt.Errorf("driveListFiles decode: %w", err)
+				}
+				ok = true
+				break
+			}
+			if resp.StatusCode == 401 && !refreshed {
+				invalidateToken()
+				refreshed = true
+				continue
+			}
+			lastErr = fmt.Errorf("driveListFiles HTTP %d: %s", resp.StatusCode, snippet(body))
+			if !isRetryableHTTPStatus(resp.StatusCode, body) {
+				return nil, lastErr
+			}
+			sleepFunc(backoffDelay(try, resp.Header.Get("Retry-After")))
+		}
+		if !ok {
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, fmt.Errorf("driveListFiles retries exhausted")
+		}
+		all = append(all, pageResp.Files...)
+		if pageResp.NextPageToken == "" {
+			break
+		}
+		pageToken = pageResp.NextPageToken
+	}
+	return all, nil
+}
+
+func initResumableUpload(cfg *Config, folderID, remoteName string, totalSize int64) (string, error) {
 	meta := map[string]interface{}{
 		"name": remoteName,
 	}
@@ -242,8 +507,14 @@ func initResumableUpload(token, folderID, remoteName string, totalSize int64) (s
 	}
 	metaBytes, _ := json.Marshal(meta)
 
-	for try := 0; try < 60; try++ {
-		initReq, err := http.NewRequest("POST", "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable", bytes.NewReader(metaBytes))
+	refreshed := false
+	var lastErr error
+	for try := 0; try < 25; try++ {
+		token, err := getAccessToken(cfg)
+		if err != nil {
+			return "", err
+		}
+		initReq, err := http.NewRequest("POST", driveAPIBase+"/upload/drive/v3/files?uploadType=resumable", bytes.NewReader(metaBytes))
 		if err != nil {
 			return "", err
 		}
@@ -258,25 +529,34 @@ func initResumableUpload(token, folderID, remoteName string, totalSize int64) (s
 		if err != nil {
 			return "", fmt.Errorf("init resumable: %w", err)
 		}
-		_, _ = io.Copy(io.Discard, initResp.Body)
+		body, _ := io.ReadAll(io.LimitReader(initResp.Body, 8192))
 		initResp.Body.Close()
 		if initResp.StatusCode == 200 {
 			loc := initResp.Header.Get("Location")
 			if loc != "" {
 				return loc, nil
 			}
+			lastErr = fmt.Errorf("init resumable: HTTP 200 missing Location header")
+		} else if initResp.StatusCode == 401 && !refreshed {
+			invalidateToken()
+			refreshed = true
+			continue
+		} else {
+			lastErr = fmt.Errorf("init resumable HTTP %d: %s", initResp.StatusCode, snippet(body))
+			if !isRetryableHTTPStatus(initResp.StatusCode, body) {
+				return "", lastErr
+			}
 		}
-		if initResp.StatusCode == 401 {
-			cachedToken = ""
-			return "", fmt.Errorf("token expired (401)")
-		}
-		time.Sleep(500 * time.Millisecond)
+		sleepFunc(backoffDelay(try, initResp.Header.Get("Retry-After")))
+	}
+	if lastErr != nil {
+		return "", lastErr
 	}
 	return "", fmt.Errorf("failed to get resumable upload URL after retries")
 }
 
 // uploadStreamResumable streams any io.Reader to uploadURL in 512 KB Scotty chunks (308 Resume Incomplete)
-// using a 1-byte lookahead, and retries the final chunk from RAM up to 60 times if Drive returns 403.
+// using a 1-byte lookahead, and retries the final chunk from RAM up to 40 times on retryable errors.
 func uploadStreamResumable(uploadURL string, src io.Reader) (string, error) {
 	var offset int64 = 0
 	var peek [1]byte
@@ -316,6 +596,7 @@ func uploadStreamResumable(uploadURL string, src io.Reader) (string, error) {
 		if !isLast {
 			contentRange := fmt.Sprintf("bytes %d-%d/*", offset, offset+int64(filled)-1)
 			ok := false
+			var lastErr error
 			for try := 0; try < 15; try++ {
 				req, err := http.NewRequest("PUT", uploadURL, bytes.NewReader(chunk))
 				if err != nil {
@@ -326,18 +607,26 @@ func uploadStreamResumable(uploadURL string, src io.Reader) (string, error) {
 				req.Header.Set("Content-Range", contentRange)
 				resp, err := httpClient.Do(req)
 				if err != nil {
-					time.Sleep(time.Second)
+					lastErr = err
+					sleepFunc(backoffDelay(try, ""))
 					continue
 				}
-				_, _ = io.Copy(io.Discard, resp.Body)
+				body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 				resp.Body.Close()
 				if resp.StatusCode == 308 || resp.StatusCode == 200 || resp.StatusCode == 201 {
 					ok = true
 					break
 				}
-				time.Sleep(500 * time.Millisecond)
+				lastErr = fmt.Errorf("intermediate chunk offset %d HTTP %d: %s", offset, resp.StatusCode, snippet(body))
+				if !isRetryableHTTPStatus(resp.StatusCode, body) {
+					return "", lastErr
+				}
+				sleepFunc(backoffDelay(try, resp.Header.Get("Retry-After")))
 			}
 			if !ok {
+				if lastErr != nil {
+					return "", lastErr
+				}
 				return "", fmt.Errorf("intermediate chunk failed at offset %d", offset)
 			}
 			offset += int64(filled)
@@ -347,7 +636,8 @@ func uploadStreamResumable(uploadURL string, src io.Reader) (string, error) {
 			contentRange := fmt.Sprintf("bytes %d-%d/%d", offset, totalSize-1, totalSize)
 			queryRange := fmt.Sprintf("bytes */%d", totalSize)
 			sendZeroByte := false
-			for try := 0; try < 120; try++ {
+			var lastErr error
+			for try := 0; try < 40; try++ {
 				var req *http.Request
 				if sendZeroByte {
 					req, err = http.NewRequest("PUT", uploadURL, nil)
@@ -367,10 +657,11 @@ func uploadStreamResumable(uploadURL string, src io.Reader) (string, error) {
 				}
 				resp, err := httpClient.Do(req)
 				if err != nil {
-					time.Sleep(time.Second)
+					lastErr = err
+					sleepFunc(backoffDelay(try, ""))
 					continue
 				}
-				body, _ := io.ReadAll(resp.Body)
+				body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 				resp.Body.Close()
 				if resp.StatusCode == 200 || resp.StatusCode == 201 {
 					var df DriveFile
@@ -380,24 +671,36 @@ func uploadStreamResumable(uploadURL string, src io.Reader) (string, error) {
 				if resp.StatusCode == 308 {
 					sendZeroByte = false
 				} else {
+					lastErr = fmt.Errorf("final commit HTTP %d: %s", resp.StatusCode, snippet(body))
+					if !isRetryableHTTPStatus(resp.StatusCode, body) {
+						return "", lastErr
+					}
 					// Toggle between re-sending final chunk and 0-byte commit query
 					sendZeroByte = !sendZeroByte
 				}
-				time.Sleep(500 * time.Millisecond)
+				d := backoffDelay(try, resp.Header.Get("Retry-After"))
+				if d > 5*time.Second {
+					d = 5 * time.Second
+				}
+				sleepFunc(d)
 			}
-			return "", fmt.Errorf("final commit chunk rate-limited after 120 retries")
+			if lastErr != nil {
+				return "", fmt.Errorf("final commit retries exhausted: %w", lastErr)
+			}
+			return "", fmt.Errorf("final commit chunk rate-limited after retries")
 		}
 	}
 }
 
-func uploadSingleFile(token, folderID, localPath, remoteName string) (string, error) {
+func uploadSingleFile(cfg *Config, folderID, localPath, remoteName string) (string, error) {
 	dropPageCache()
 	defer dropPageCache()
 
-	if _, err := os.Stat(localPath); err != nil {
+	st, err := os.Stat(localPath)
+	if err != nil {
 		return "", err
 	}
-	uploadURL, err := initResumableUpload(token, folderID, remoteName, -1)
+	uploadURL, err := initResumableUpload(cfg, folderID, remoteName, st.Size())
 	if err != nil {
 		return "", err
 	}
@@ -498,103 +801,135 @@ func patchMoof(b []byte, seqNum uint32, timeOffsetMS uint64) uint64 {
 	return maxEndDT
 }
 
-func uploadMergedBlock(token, dayFolderID, blockName string, files []string) (string, error) {
+type writeTracker struct {
+	w   io.Writer
+	err error
+}
+
+func (wt *writeTracker) Write(p []byte) (int, error) {
+	n, err := wt.w.Write(p)
+	if err != nil {
+		wt.err = err
+	}
+	return n, err
+}
+
+func mergeOneClip(w io.Writer, path string, copyBuf []byte, moofBuf *[]byte, wroteInit *bool, seqNum *uint32, offsetMS uint64) (uint64, error) {
+	dropPageCache()
+	f, err := os.Open(path)
+	if err != nil {
+		return offsetMS, nil
+	}
+	defer func() {
+		f.Close()
+		dropPageCache()
+	}()
+
+	br := bufio.NewReaderSize(&cacheDroppingReader{r: f}, 32*1024)
+	wt := &writeTracker{w: w}
+	fileMaxEnd := offsetMS
+	var hdr [8]byte
+
+	for {
+		if _, err := io.ReadFull(br, hdr[:]); err != nil {
+			return fileMaxEnd, nil
+		}
+		sz := int64(binary.BigEndian.Uint32(hdr[0:4]))
+		typ := string(hdr[4:8])
+		if sz < 8 || sz > 32*1024*1024 {
+			return fileMaxEnd, nil
+		}
+		payloadLen := sz - 8
+
+		switch typ {
+		case "ftyp", "free", "moov":
+			if !*wroteInit {
+				if _, err := wt.Write(hdr[:]); err != nil {
+					return fileMaxEnd, err
+				}
+				if _, err := io.CopyBuffer(wt, io.LimitReader(br, payloadLen), copyBuf); err != nil {
+					if wt.err != nil {
+						return fileMaxEnd, wt.err
+					}
+					return fileMaxEnd, nil
+				}
+				if typ == "moov" {
+					*wroteInit = true
+				}
+			} else {
+				if _, err := io.CopyBuffer(io.Discard, io.LimitReader(br, payloadLen), copyBuf); err != nil {
+					return fileMaxEnd, nil
+				}
+			}
+		case "moof":
+			if sz > maxMoofSize {
+				return fileMaxEnd, nil
+			}
+			if cap(*moofBuf) < int(sz) {
+				*moofBuf = make([]byte, sz)
+			}
+			buf := (*moofBuf)[:sz]
+			copy(buf[0:8], hdr[:])
+			if _, err := io.ReadFull(br, buf[8:]); err != nil {
+				return fileMaxEnd, nil
+			}
+			endDT := patchMoof(buf, *seqNum, offsetMS)
+			*seqNum++
+			if endDT > fileMaxEnd {
+				fileMaxEnd = endDT
+			}
+			if _, err := wt.Write(buf); err != nil {
+				return fileMaxEnd, err
+			}
+		case "mdat":
+			if _, err := wt.Write(hdr[:]); err != nil {
+				return fileMaxEnd, err
+			}
+			if _, err := io.CopyBuffer(wt, io.LimitReader(br, payloadLen), copyBuf); err != nil {
+				if wt.err != nil {
+					return fileMaxEnd, wt.err
+				}
+				return fileMaxEnd, nil
+			}
+		default:
+			if _, err := io.CopyBuffer(io.Discard, io.LimitReader(br, payloadLen), copyBuf); err != nil {
+				return fileMaxEnd, nil
+			}
+		}
+	}
+}
+
+func mergeMP4Clips(w io.Writer, files []string) error {
+	var seqNum uint32 = 1
+	var offsetMS uint64 = 0
+	copyBuf := make([]byte, 32*1024)
+	var moofBuf []byte
+	wroteInit := false
+
+	for _, path := range files {
+		nextOffset, err := mergeOneClip(w, path, copyBuf, &moofBuf, &wroteInit, &seqNum, offsetMS)
+		if err != nil {
+			return err
+		}
+		offsetMS = nextOffset
+	}
+	return nil
+}
+
+func uploadMergedBlock(cfg *Config, dayFolderID, blockName string, files []string) (string, error) {
 	dropPageCache()
 	defer dropPageCache()
 
 	remoteName := blockName + ".mp4"
-	uploadURL, err := initResumableUpload(token, dayFolderID, remoteName, -1)
+	uploadURL, err := initResumableUpload(cfg, dayFolderID, remoteName, -1)
 	if err != nil {
 		return "", err
 	}
 
 	pr, pw := io.Pipe()
+	defer pr.Close()
 	go func() {
-		var seqNum uint32 = 1
-		var offsetMS uint64 = 0
-		copyBuf := make([]byte, 32*1024)
-		var hdr [8]byte
-		wroteInit := false
-
-		for _, path := range files {
-			dropPageCache()
-			f, err := os.Open(path)
-			if err != nil {
-				continue
-			}
-			br := bufio.NewReaderSize(&cacheDroppingReader{r: f}, 32*1024)
-			fileMaxEnd := offsetMS
-
-			for {
-				if _, err := io.ReadFull(br, hdr[:]); err != nil {
-					break
-				}
-				sz := int64(binary.BigEndian.Uint32(hdr[0:4]))
-				typ := string(hdr[4:8])
-				if sz < 8 || sz > 32*1024*1024 {
-					break
-				}
-				payloadLen := sz - 8
-
-				switch typ {
-				case "ftyp", "free", "moov":
-					if !wroteInit {
-						if _, err := pw.Write(hdr[:]); err != nil {
-							f.Close()
-							_ = pw.CloseWithError(err)
-							return
-						}
-						if _, err := io.CopyBuffer(pw, io.LimitReader(br, payloadLen), copyBuf); err != nil {
-							f.Close()
-							_ = pw.CloseWithError(err)
-							return
-						}
-						if typ == "moov" {
-							wroteInit = true
-						}
-					} else {
-						if _, err := io.CopyBuffer(io.Discard, io.LimitReader(br, payloadLen), copyBuf); err != nil {
-							break
-						}
-					}
-				case "moof":
-					moofBuf := make([]byte, sz)
-					copy(moofBuf[0:8], hdr[:])
-					if _, err := io.ReadFull(br, moofBuf[8:]); err != nil {
-						break
-					}
-					endDT := patchMoof(moofBuf, seqNum, offsetMS)
-					seqNum++
-					if endDT > fileMaxEnd {
-						fileMaxEnd = endDT
-					}
-					if _, err := pw.Write(moofBuf); err != nil {
-						f.Close()
-						_ = pw.CloseWithError(err)
-						return
-					}
-				case "mdat":
-					if _, err := pw.Write(hdr[:]); err != nil {
-						f.Close()
-						_ = pw.CloseWithError(err)
-						return
-					}
-					if _, err := io.CopyBuffer(pw, io.LimitReader(br, payloadLen), copyBuf); err != nil {
-						f.Close()
-						_ = pw.CloseWithError(err)
-						return
-					}
-				default:
-					if _, err := io.CopyBuffer(io.Discard, io.LimitReader(br, payloadLen), copyBuf); err != nil {
-						break
-					}
-				}
-			}
-			f.Close()
-			dropPageCache()
-			offsetMS = fileMaxEnd
-		}
-		_ = pw.Close()
+		_ = pw.CloseWithError(mergeMP4Clips(pw, files))
 	}()
 
 	return uploadStreamResumable(uploadURL, pr)
@@ -618,12 +953,12 @@ func blockLabel(blockIdx int) string {
 	return fmt.Sprintf("%02d-%02d", start, end)
 }
 
-func scanClips(mediaDir string, retentionHrs int) ([]ClipInfo, error) {
+func scanClips(mediaDir string, scanHrs int, tzOffsetMin int) ([]ClipInfo, error) {
 	cutoffYM := ""
 	cutoffYMD := ""
-	ist := time.Now().UTC().Add(5*time.Hour + 30*time.Minute)
-	if ist.Year() >= 2025 && retentionHrs > 0 {
-		cut := ist.Add(-time.Duration(retentionHrs) * time.Hour)
+	now := cameraNow(tzOffsetMin)
+	if now.Year() >= 2025 && scanHrs > 0 {
+		cut := now.Add(-time.Duration(scanHrs) * time.Hour)
 		cutoffYM = fmt.Sprintf("%04d%02d", cut.Year(), int(cut.Month()))
 		cutoffYMD = fmt.Sprintf("%04d%02d%02d", cut.Year(), int(cut.Month()), cut.Day())
 	}
@@ -682,6 +1017,9 @@ func scanClips(mediaDir string, retentionHrs int) ([]ClipInfo, error) {
 			monthName = ym[:4] + "-" + ym[4:6]
 		}
 		dayName := strings.TrimSuffix(parts[1], "d")
+		if len(dayName) == 1 {
+			dayName = "0" + dayName
+		}
 		hrStr := strings.TrimSuffix(parts[2], "h")
 		hr, err := strconv.Atoi(hrStr)
 		if err != nil || hr < 0 || hr > 23 {
@@ -708,12 +1046,12 @@ func scanClips(mediaDir string, retentionHrs int) ([]ClipInfo, error) {
 	return clips, err
 }
 
-func currentISTBlockKey(clips []ClipInfo) string {
-	ist := time.Now().UTC().Add(5*time.Hour + 30*time.Minute)
-	if ist.Year() >= 2025 {
-		monthName := fmt.Sprintf("%04d-%02d", ist.Year(), int(ist.Month()))
-		dayName := fmt.Sprintf("%02d", ist.Day())
-		bName := blockLabel(ist.Hour() / 3)
+func currentBlockKey(clips []ClipInfo, tzOffsetMin int) string {
+	now := cameraNow(tzOffsetMin)
+	if now.Year() >= 2025 {
+		monthName := fmt.Sprintf("%04d-%02d", now.Year(), int(now.Month()))
+		dayName := fmt.Sprintf("%02d", now.Day())
+		bName := blockLabel(now.Hour() / 3)
 		return fmt.Sprintf("BLOCK:%s/%s/%s", monthName, dayName, bName)
 	}
 	if len(clips) > 0 {
@@ -771,72 +1109,90 @@ func appendUploaded(path, key string) {
 
 var lastRetentionCheck time.Time
 
-func deleteOldDriveFiles(token, rootFolderID string, retentionHrs int) {
+func deleteOldDriveFiles(cfg *Config, rootFolderID string, retentionHrs int, tzOffsetMin int) {
 	if retentionHrs <= 0 || rootFolderID == "" {
 		return
 	}
 	if !lastRetentionCheck.IsZero() && time.Since(lastRetentionCheck) < time.Hour {
 		return
 	}
-	ist := time.Now().UTC().Add(5*time.Hour + 30*time.Minute)
-	if ist.Year() < 2025 {
+	now := cameraNow(tzOffsetMin)
+	if now.Year() < 2025 {
 		return
 	}
-	lastRetentionCheck = time.Now()
-	cut := ist.Add(-time.Duration(retentionHrs) * time.Hour)
+	cut := now.Add(-time.Duration(retentionHrs) * time.Hour)
 	cutoffYMD := fmt.Sprintf("%04d-%02d-%02d", cut.Year(), int(cut.Month()), cut.Day())
 	cutoffYM := fmt.Sprintf("%04d-%02d", cut.Year(), int(cut.Month()))
 
 	// List YYYY-MM month folders strictly inside CCTV/ (rootFolderID)
-	mq := fmt.Sprintf("mimeType = 'application/vnd.google-apps.folder' and '%s' in parents and trashed = false", rootFolderID)
-	mu := "https://www.googleapis.com/drive/v3/files?pageSize=50&fields=files(id,name)&q=" + url.QueryEscape(mq)
-	mreq, _ := http.NewRequest("GET", mu, nil)
-	mreq.Header.Set("Authorization", "Bearer "+token)
-	mresp, err := httpClient.Do(mreq)
+	mq := fmt.Sprintf("mimeType = 'application/vnd.google-apps.folder' and '%s' in parents and trashed = false", escapeDriveQueryValue(rootFolderID))
+	months, err := driveListFiles(cfg, mq, "files(id,name)")
 	if err != nil {
+		logf("[err] retention list months: %v", err)
 		return
 	}
-	mbody, _ := io.ReadAll(mresp.Body)
-	mresp.Body.Close()
-	var mlist DriveListResp
-	if json.Unmarshal(mbody, &mlist) != nil {
-		return
-	}
-	for _, mf := range mlist.Files {
+
+	hadError := false
+	for _, mf := range months {
 		if len(mf.Name) != 7 || mf.Name[4] != '-' || mf.Name > cutoffYM {
 			continue
 		}
-		dq := fmt.Sprintf("mimeType = 'application/vnd.google-apps.folder' and '%s' in parents and trashed = false", mf.ID)
-		du := "https://www.googleapis.com/drive/v3/files?pageSize=50&fields=files(id,name)&q=" + url.QueryEscape(dq)
-		dreq, _ := http.NewRequest("GET", du, nil)
-		dreq.Header.Set("Authorization", "Bearer "+token)
-		dresp, err := httpClient.Do(dreq)
+		dq := fmt.Sprintf("mimeType = 'application/vnd.google-apps.folder' and '%s' in parents and trashed = false", escapeDriveQueryValue(mf.ID))
+		days, err := driveListFiles(cfg, dq, "files(id,name)")
 		if err != nil {
-			continue
-		}
-		dbody, _ := io.ReadAll(dresp.Body)
-		dresp.Body.Close()
-		var dlist DriveListResp
-		if json.Unmarshal(dbody, &dlist) != nil {
+			logf("[err] retention list days %s: %v", mf.Name, err)
+			hadError = true
 			continue
 		}
 		remaining := 0
-		for _, df := range dlist.Files {
+		for _, df := range days {
 			dayName := df.Name
 			if len(dayName) == 1 {
 				dayName = "0" + dayName
 			}
 			ymd := mf.Name + "-" + dayName
 			if len(dayName) == 2 && ymd < cutoffYMD {
-				deleteDriveObject(token, df.ID)
-				fmt.Printf("[retention] deleted expired day folder %s/%s (%s)\n", mf.Name, df.Name, df.ID)
+				if err := deleteDriveObject(cfg, df.ID); err != nil {
+					logf("[err] retention delete day %s/%s (%s): %v", mf.Name, df.Name, df.ID, err)
+					hadError = true
+					remaining++
+				} else {
+					logf("[retention] deleted expired day folder %s/%s (%s)", mf.Name, df.Name, df.ID)
+				}
 			} else {
 				remaining++
 			}
 		}
 		if remaining == 0 && mf.Name < cutoffYM {
-			deleteDriveObject(token, mf.ID)
-			fmt.Printf("[retention] deleted empty expired month folder %s (%s)\n", mf.Name, mf.ID)
+			if err := deleteDriveObject(cfg, mf.ID); err != nil {
+				logf("[err] retention delete month %s (%s): %v", mf.Name, mf.ID, err)
+				hadError = true
+			} else {
+				logf("[retention] deleted empty expired month folder %s (%s)", mf.Name, mf.ID)
+			}
+		}
+	}
+	if !hadError {
+		lastRetentionCheck = time.Now()
+	}
+}
+
+func cleanupLiveFolder(cfg *Config, dayID, blockName string) {
+	q := fmt.Sprintf(
+		"mimeType = 'application/vnd.google-apps.folder' and name = '%s' and '%s' in parents and trashed = false",
+		escapeDriveQueryValue("live_"+blockName),
+		escapeDriveQueryValue(dayID),
+	)
+	folders, err := driveListFiles(cfg, q, "files(id,name)")
+	if err != nil {
+		logf("[err] cleanup lookup live_%s: %v", blockName, err)
+		return
+	}
+	for _, lf := range folders {
+		if err := deleteDriveObject(cfg, lf.ID); err != nil {
+			logf("[err] cleanup remove %s (%s): %v", lf.Name, lf.ID, err)
+		} else {
+			logf("[cleanup] removed temporary folder %s (%s)", lf.Name, lf.ID)
 		}
 	}
 }
@@ -845,16 +1201,17 @@ func main() {
 	debug.SetGCPercent(20)
 	debug.SetMemoryLimit(5 * 1024 * 1024)
 
-	if len(os.Args) > 1 && os.Args[1] == "--selftest" {
+	args := os.Args[1:]
+	if len(args) > 0 && args[0] == "--selftest" {
 		caFile := ""
-		if len(os.Args) > 2 {
-			caFile = os.Args[2]
+		if len(args) > 1 {
+			caFile = args[1]
 		}
 		if err := initHTTP(caFile); err != nil {
 			fmt.Println("initHTTP err:", err)
 			os.Exit(1)
 		}
-		resp, err := httpClient.Get("https://www.googleapis.com/discovery/v1/apis/drive/v3/rest")
+		resp, err := httpClient.Get(driveAPIBase + "/discovery/v1/apis/drive/v3/rest")
 		if err != nil {
 			fmt.Println("HTTPS test err:", err)
 			os.Exit(1)
@@ -864,23 +1221,32 @@ func main() {
 		return
 	}
 
-	cfgPath := "/conf/gdrive.json"
-	if len(os.Args) > 1 {
-		cfgPath = os.Args[1]
+	if len(args) >= 2 && args[0] == "--log" {
+		logMu.Lock()
+		logFilePath = args[1]
+		logMu.Unlock()
+		args = args[2:]
 	}
+
+	cfgPath := "/conf/gdrive.json"
+	if len(args) > 0 {
+		cfgPath = args[0]
+	}
+
+	var lastClientID, lastClientSecret, lastRefreshToken string
 
 	for {
 		dropPageCache()
 		cfgBytes, err := os.ReadFile(cfgPath)
 		if err != nil {
-			fmt.Printf("[wait] waiting for config %s: %v\n", cfgPath, err)
-			time.Sleep(15 * time.Second)
+			logf("[wait] waiting for config %s: %v", cfgPath, err)
+			sleepFunc(15 * time.Second)
 			continue
 		}
 		var cfg Config
 		if err := json.Unmarshal(cfgBytes, &cfg); err != nil {
-			fmt.Printf("[err] invalid config JSON: %v\n", err)
-			time.Sleep(15 * time.Second)
+			logf("[err] invalid config JSON: %v", err)
+			sleepFunc(15 * time.Second)
 			continue
 		}
 		if cfg.MediaDir == "" {
@@ -898,17 +1264,36 @@ func main() {
 		if cfg.PollSeconds <= 0 {
 			cfg.PollSeconds = 20
 		}
+		if err := validateConfig(&cfg); err != nil {
+			logf("[err] invalid config: %v", err)
+			sleepFunc(15 * time.Second)
+			continue
+		}
+		if cfg.ClientID != lastClientID || cfg.ClientSecret != lastClientSecret || cfg.RefreshToken != lastRefreshToken {
+			invalidateToken()
+			lastClientID = cfg.ClientID
+			lastClientSecret = cfg.ClientSecret
+			lastRefreshToken = cfg.RefreshToken
+		}
 		if httpClient == nil {
 			if err := initHTTP(cfg.CACertFile); err != nil {
-				fmt.Printf("[err] initHTTP: %v\n", err)
-				time.Sleep(15 * time.Second)
+				logf("[err] initHTTP: %v", err)
+				sleepFunc(15 * time.Second)
 				continue
 			}
 		}
 
+		tzOff := tzOffsetMinutes(&cfg)
+		scanHrs := 72
+		if cfg.RetentionHrs > 0 && cfg.RetentionHrs < scanHrs {
+			scanHrs = cfg.RetentionHrs
+		}
 		uploaded := loadUploadedSet(cfg.StateFile)
-		clips, _ := scanClips(cfg.MediaDir, 72)
-		activeBlock := currentISTBlockKey(clips)
+		clips, scanErr := scanClips(cfg.MediaDir, scanHrs, tzOff)
+		if scanErr != nil {
+			logf("[warn] scanClips %s: %v", cfg.MediaDir, scanErr)
+		}
+		activeBlock := currentBlockKey(clips, tzOff)
 
 		blockMap := make(map[string][]ClipInfo)
 		var blockOrder []string
@@ -919,19 +1304,18 @@ func main() {
 			blockMap[c.BlockKey] = append(blockMap[c.BlockKey], c)
 		}
 
-		token, err := getAccessToken(&cfg)
-		if err != nil {
-			fmt.Printf("[err] token: %v\n", err)
-			time.Sleep(time.Duration(cfg.PollSeconds) * time.Second)
+		if _, err := getAccessToken(&cfg); err != nil {
+			logf("[err] token: %v", err)
+			sleepFunc(time.Duration(cfg.PollSeconds) * time.Second)
 			continue
 		}
 
 		rootID := cfg.FolderID
 		if rootID == "" {
-			rootID, err = ensureSubfolder(token, "", cfg.FolderName)
+			rootID, err = ensureSubfolder(&cfg, "", cfg.FolderName)
 			if err != nil {
-				fmt.Printf("[err] root folder: %v\n", err)
-				time.Sleep(time.Duration(cfg.PollSeconds) * time.Second)
+				logf("[err] root folder: %v", err)
+				sleepFunc(time.Duration(cfg.PollSeconds) * time.Second)
 				continue
 			}
 		}
@@ -943,26 +1327,29 @@ func main() {
 				if uploaded[c.RelKey] {
 					continue
 				}
-				monthID, err := ensureSubfolder(token, rootID, c.MonthName)
+				monthID, err := ensureSubfolder(&cfg, rootID, c.MonthName)
 				if err != nil {
+					logf("[err] month folder %s: %v", c.MonthName, err)
 					break
 				}
-				dayID, err := ensureSubfolder(token, monthID, c.DayName)
+				dayID, err := ensureSubfolder(&cfg, monthID, c.DayName)
 				if err != nil {
+					logf("[err] day folder %s: %v", c.DayName, err)
 					break
 				}
-				liveFolderID, err := ensureSubfolder(token, dayID, "live_"+c.BlockName)
+				liveFolderID, err := ensureSubfolder(&cfg, dayID, "live_"+c.BlockName)
 				if err != nil {
+					logf("[err] live folder %s: %v", c.BlockName, err)
 					break
 				}
-				fmt.Printf("[live] uploading %s/%s/live_%s/%s ...\n", c.MonthName, c.DayName, c.BlockName, c.LiveName)
+				logf("[live] uploading %s/%s/live_%s/%s ...", c.MonthName, c.DayName, c.BlockName, c.LiveName)
 				t0 := time.Now()
-				id, err := uploadSingleFile(token, liveFolderID, c.FullPath, c.LiveName)
+				id, err := uploadSingleFile(&cfg, liveFolderID, c.FullPath, c.LiveName)
 				if err != nil {
-					fmt.Printf("[err] live upload %s: %v\n", c.LiveName, err)
+					logf("[err] live upload %s: %v", c.LiveName, err)
 					break
 				}
-				fmt.Printf("[ok-live] uploaded %s -> id=%s in %s\n", c.LiveName, id, time.Since(t0).Round(time.Millisecond))
+				logf("[ok-live] uploaded %s -> id=%s in %s", c.LiveName, id, time.Since(t0).Round(time.Millisecond))
 				uploaded[c.RelKey] = true
 				appendUploaded(cfg.StateFile, c.RelKey)
 				runtime.GC()
@@ -979,53 +1366,39 @@ func main() {
 				continue
 			}
 			c0 := bClips[0]
-			monthID, err := ensureSubfolder(token, rootID, c0.MonthName)
+			monthID, err := ensureSubfolder(&cfg, rootID, c0.MonthName)
 			if err != nil {
-				fmt.Printf("[err] month folder %s: %v\n", c0.MonthName, err)
+				logf("[err] month folder %s: %v", c0.MonthName, err)
 				break
 			}
-			dayID, err := ensureSubfolder(token, monthID, c0.DayName)
+			dayID, err := ensureSubfolder(&cfg, monthID, c0.DayName)
 			if err != nil {
-				fmt.Printf("[err] day folder %s: %v\n", c0.DayName, err)
+				logf("[err] day folder %s: %v", c0.DayName, err)
 				break
 			}
 			var filePaths []string
 			for _, c := range bClips {
 				filePaths = append(filePaths, c.FullPath)
 			}
-			fmt.Printf("[merge] stream-merging %d clips -> %s/%s/%s.mp4 ...\n", len(filePaths), c0.MonthName, c0.DayName, c0.BlockName)
+			logf("[merge] stream-merging %d clips -> %s/%s/%s.mp4 ...", len(filePaths), c0.MonthName, c0.DayName, c0.BlockName)
 			t0 := time.Now()
-			id, err := uploadMergedBlock(token, dayID, c0.BlockName, filePaths)
+			id, err := uploadMergedBlock(&cfg, dayID, c0.BlockName, filePaths)
 			if err != nil {
-				fmt.Printf("[err] merge %s: %v\n", bKey, err)
+				logf("[err] merge %s: %v", bKey, err)
 				break
 			}
-			fmt.Printf("[ok-merge] uploaded %s/%s/%s.mp4 -> id=%s in %s\n", c0.MonthName, c0.DayName, c0.BlockName, id, time.Since(t0).Round(time.Millisecond))
+			logf("[ok-merge] uploaded %s/%s/%s.mp4 -> id=%s in %s", c0.MonthName, c0.DayName, c0.BlockName, id, time.Since(t0).Round(time.Millisecond))
 			uploaded[bKey] = true
 			appendUploaded(cfg.StateFile, bKey)
 
 			// Delete temporary live_<block> folder once the merged 3-hour video is uploaded
-			q := fmt.Sprintf("mimeType = 'application/vnd.google-apps.folder' and name = 'live_%s' and '%s' in parents and trashed = false", c0.BlockName, dayID)
-			u := "https://www.googleapis.com/drive/v3/files?pageSize=5&fields=files(id,name)&q=" + url.QueryEscape(q)
-			req, _ := http.NewRequest("GET", u, nil)
-			req.Header.Set("Authorization", "Bearer "+token)
-			if resp, err := httpClient.Do(req); err == nil {
-				body, _ := io.ReadAll(resp.Body)
-				resp.Body.Close()
-				var list DriveListResp
-				if json.Unmarshal(body, &list) == nil {
-					for _, lf := range list.Files {
-						deleteDriveObject(token, lf.ID)
-						fmt.Printf("[cleanup] removed temporary folder %s (%s)\n", lf.Name, lf.ID)
-					}
-				}
-			}
+			cleanupLiveFolder(&cfg, dayID, c0.BlockName)
 			runtime.GC()
 			break
 		}
 
-		deleteOldDriveFiles(token, rootID, cfg.RetentionHrs)
+		deleteOldDriveFiles(&cfg, rootID, cfg.RetentionHrs, tzOff)
 		runtime.GC()
-		time.Sleep(time.Duration(cfg.PollSeconds) * time.Second)
+		sleepFunc(time.Duration(cfg.PollSeconds) * time.Second)
 	}
 }

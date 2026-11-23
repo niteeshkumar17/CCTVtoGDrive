@@ -86,7 +86,7 @@ Clips are fragmented MP4 (`ftyp` + `moov` + `moof`/`mdat`, 1000 Hz timestamps). 
 
 Memory on the camera is about 32 MB. The uploader drops the Linux page cache while streaming and keeps a small heap limit so recording is not pushed into swap.
 
-`retention_hours` is how long files stay in Drive. Set it from your own free space. This camera records about 4.5–5 GB a day, so `hours = (free GB / 5) × 24`. A 15 GB free account can hold about 3 days (`72`). A plan with a few hundred GB free can hold longer. The 72-hour SD-card scan is separate and is not controlled by this number.
+`retention_hours` is how long files stay in Drive. Set it from your own free space. This camera records about 4.5–5 GB a day, so `hours = (free GB / 5) × 24`. A 15 GB free account can hold about 3 days (`72`). A plan with a few hundred GB free can hold longer. The 72-hour SD-card scan is separate and is not controlled by this number (capped by `retention_hours` when shorter). `tz_offset_minutes` sets the camera's local timezone offset for 3-hour window boundaries and retention cutoffs (defaults to `330`, IST).
 
 ## Layout of this repo
 
@@ -112,7 +112,7 @@ These stay on the machine that deploys the camera and are listed in `.gitignore`
 From WSL, with Go and `squashfs-tools`:
 
 ```bash
-sudo bash tools/build.sh
+bash tools/build.sh
 ```
 
 Copy `tools/gdrive.json.example` to `tools/gdrive.json` and fill in the OAuth client, refresh token, and Drive folder id. Create those in Google Cloud for a Drive scope of `https://www.googleapis.com/auth/drive`, limited to the account that owns the CCTV folder. Prefer your own OAuth client. A widely shared public client is rate-limited and was the cause of upload retries.
@@ -174,7 +174,7 @@ If your dumped `etc/shadow` uses the salt `soidjfoi`, it is the same rootfs fami
 The camera only has a private address. Nothing in this project opens a tunnel or a port forward. A host on the internet cannot open telnet to it. The phone app still works from outside, because the camera calls out to the vendor cloud the same way it did before. That path cannot use the telnet shell.
 
 **Any device on this Wi-Fi can reach telnet.**  
-Port 23 asks for the root password. The patched boot script also starts `telnetd -l /bin/sh -p 2323`, which is a root shell with no password. That was a recovery shortcut. On a shared network, disable port 2323 and keep only the password login. Do not put the password or `gdrive.json` in git.
+Port 23 asks for the root password. `tools/patch_rootfs.sh` enables only port 23 with password login (no passwordless shell). If an older recovery flash on your camera still starts `telnetd -l /bin/sh -p 2323`, disable port 2323 on a shared network so only the password login stays open. Do not put the password or `gdrive.json` in git.
 
 **Do not factory-reset the camera, and do not format the SD card from the app.**  
 Reset would remove the telnet patch only if the rootfs itself were restored; format would delete `/mnt/sdcard/bin/tools.sqsh`. The boot hook and config are on internal flash, so the binary can be copied back over Wi-Fi, but only while telnet still works.
@@ -188,7 +188,7 @@ When the card is full, the stock app deletes old day folders with `rm -rf /mnt/s
 Drive only keeps an upload after the file is fully closed. Finished 5-minute clips are already in `live_HH-HH/`. The open `.cache.mp4` is not. Worst case is about one to five minutes missing at the moment the camera dies, plus whatever was mid-upload. This is not a zero-gap recorder.
 
 **`/conf` is only 384 KB.**  
-The ledger `/conf/uploaded_v2.log` is trimmed when it grows past 8 KB. Do not store the binary or long logs there.
+The ledger `/conf/uploaded_v2.log` is trimmed when it grows past 8 KB, and `/tmp/gdrive.log` in RAM is self-capped at 32 KB. Do not store the binary or long logs in `/conf`.
 
 **Serial work, if it is ever needed again.**  
 Three wires only: camera TX to adapter RX, camera RX to adapter TX, GND to GND. Do not connect the adapter's positive pin. Remove the wires before closing the case so they cannot short. Normal updates do not need the case open.

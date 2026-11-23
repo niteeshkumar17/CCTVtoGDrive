@@ -5,6 +5,7 @@
   "folder_id": "GOOGLE_DRIVE_CCTV_FOLDER_ID",
   "folder_name": "CCTV",
   "retention_hours": 72,
+  "tz_offset_minutes": 330,
   "media_dir": "/mnt/sdcard/Media",
   "state_file": "/conf/uploaded_v2.log",
   "ca_cert_file": "/tmp/tools/cacert.pem",

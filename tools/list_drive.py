@@ -1,6 +1,8 @@
 import json
 import pathlib
+import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -13,26 +15,50 @@ data = urllib.parse.urlencode(
         "grant_type": "refresh_token",
     }
 ).encode()
-with urllib.request.urlopen(urllib.request.Request("https://oauth2.googleapis.com/token", data=data)) as r:
+with urllib.request.urlopen(urllib.request.Request("https://oauth2.googleapis.com/token", data=data), timeout=15) as r:
     access_token = json.loads(r.read().decode())["access_token"]
 
 
-def gget(url):
-    for _ in range(120):
+def gget(url: str) -> dict:
+    for attempt in range(8):
         try:
             req = urllib.request.Request(url, headers={"Authorization": "Bearer " + access_token})
-            with urllib.request.urlopen(req, timeout=10) as r:
+            with urllib.request.urlopen(req, timeout=15) as r:
                 return json.loads(r.read().decode())
-        except Exception:
-            time.sleep(0.5)
-    print("WARN: gget exhausted retries for", url)
+        except urllib.error.HTTPError as e:
+            body = e.read(512).decode("utf-8", "replace")
+            retryable_403 = e.code == 403 and ("rateLimitExceeded" in body or "userRateLimitExceeded" in body)
+            if e.code in (429, 500, 502, 503, 504) or retryable_403:
+                time.sleep(min(10.0, 0.5 * (2**attempt)))
+                continue
+            raise SystemExit(f"Google Drive API HTTP {e.code} for {url}: {body.strip()}")
+        except Exception as e:
+            if attempt == 7:
+                print(f"WARN: gget failed for {url}: {e}", file=sys.stderr)
+                return {}
+            time.sleep(min(10.0, 0.5 * (2**attempt)))
+    print("WARN: gget exhausted retries for", url, file=sys.stderr)
     return {}
 
 
-def walk(parent_id, indent=""):
+def walk(parent_id: str, indent: str = "") -> None:
     q = urllib.parse.quote(f"'{parent_id}' in parents and trashed = false")
-    res = gget(f"https://www.googleapis.com/drive/v3/files?pageSize=50&fields=files(id,name,mimeType,size)&q={q}")
-    files = sorted(res.get("files", []), key=lambda x: x["name"])
+    files = []
+    page_token = ""
+    while True:
+        url = (
+            "https://www.googleapis.com/drive/v3/files"
+            f"?pageSize=100&fields=nextPageToken,files(id,name,mimeType,size)&q={q}"
+        )
+        if page_token:
+            url += "&pageToken=" + urllib.parse.quote(page_token)
+        res = gget(url)
+        files.extend(res.get("files", []))
+        page_token = res.get("nextPageToken", "")
+        if not page_token:
+            break
+
+    files.sort(key=lambda x: x["name"])
     for f in files:
         if f["mimeType"] == "application/vnd.google-apps.folder":
             print(f"{indent}[Folder] {f['name']}/  (id={f['id']})")
